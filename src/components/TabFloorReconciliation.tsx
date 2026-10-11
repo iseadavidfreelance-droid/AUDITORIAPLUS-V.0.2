@@ -1,0 +1,617 @@
+/**
+ * AUDITORIAPLUS+ - Tab 3: Reconciliación Bidireccional (Agnóstica)
+ * Flujo de Compensación Asíncrona de Inventario (Origen vs Destino)
+ * FASE 3: Fetch API en Vivo y Confirmación Humana de Traslados
+ */
+
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  AlertTriangle,
+  ArrowRight,
+  CheckCircle2,
+  RefreshCw,
+  Search,
+  Store,
+  Layers,
+  X,
+  ArrowRightLeft
+} from 'lucide-react';
+import { supabase, isSupabaseConfigured } from '../lib/supabase';
+import { useMissionStore } from '../store/useMissionStore';
+import { useDiscrepancyStore } from '../stores/useDiscrepancyStore';
+import { useOnlineStatus } from '../hooks/useOnlineStatus';
+import { enqueueOfflineEvent } from '../lib/db';
+import { FloorDiscrepancy, VirtualTransfer } from '../types/audit';
+import { useAuthStore } from '../stores/useAuthStore';
+
+export const TabFloorReconciliation: React.FC = () => {
+  const isOnline = useOnlineStatus();
+  const { activeMissionId, fetchMissionTasks } = useMissionStore();
+  const user = useAuthStore((state) => state.user);
+
+  const {
+    pendingFloorDiscrepancies,
+    virtualTransfers,
+    setPendingDiscrepancies,
+    resolveDiscrepancyLocally,
+    setVirtualTransfers,
+  } = useDiscrepancyStore();
+
+  const [selectedDiscrepancy, setSelectedDiscrepancy] = useState<FloorDiscrepancy | null>(null);
+  const [floorCountedInput, setFloorCountedInput] = useState<string>('');
+  const [floorSystemInput, setFloorSystemInput] = useState<string>('0');
+
+  // Estados de carga e interfaz
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const [isFetchingLive, setIsFetchingLive] = useState<boolean>(false);
+
+  const [filterQuery, setFilterQuery] = useState<string>('');
+  const [toast, setToast] = useState<{ text: string; type: 'success' | 'warning' | 'error' } | null>(null);
+
+  // Carga paralela: Discrepancias Pendientes + Todos los Traslados
+  const fetchOpenDiscrepancies = useCallback(async () => {
+    if (!activeMissionId || !isSupabaseConfigured) return;
+
+    setIsLoading(true);
+    try {
+      // 1. Carga de Discrepancias Pendientes en Piso
+      const { data, error } = await supabase
+        .from('Read_Floor_Discrepancies')
+        .select('*')
+        .eq('MissionId', activeMissionId)
+        .or('Status.eq.OPEN,Status.eq.PENDING_TARGET_COUNT,Status.eq.PENDING_FLOOR_COUNT')
+        .order('CreatedAt', { ascending: false });
+
+      if (error) {
+        console.warn('[TabFloorReconciliation] Error BD Discrepancias:', error);
+      } else if (data) {
+        const mappedDiscrepancies: FloorDiscrepancy[] = data.map((d) => {
+          const originDisc = Number(d.OriginDiscrepancy ?? d.originDiscrepancy ?? d.WarehouseDiscrepancy ?? 0);
+          return {
+            discrepancyId: d.DiscrepancyId || d.discrepancyId,
+            taskId: d.TaskId || d.taskId || '',
+            missionId: d.MissionId || d.missionId || activeMissionId,
+            skuCode: d.SkuCode || d.skuCode || '',
+            skuDescription: d.SkuDescription || d.skuDescription || 'Artículo',
+            originDeposit: d.OriginDeposit || d.originDeposit || '150101',
+            targetDeposit: d.TargetDeposit || d.targetDeposit || d.FloorDeposit || '150103',
+            originDiscrepancy: originDisc,
+            targetSystemQuantity: Number(d.TargetSystemQuantity ?? d.targetSystemQuantity ?? d.FloorSystemQuantity ?? 0),
+            targetCountedQuantity: d.TargetCountedQuantity ?? d.targetCountedQuantity ?? null,
+            targetDiscrepancy: d.TargetDiscrepancy ?? d.targetDiscrepancy ?? null,
+            status: d.Status || 'OPEN',
+            resolvedAt: d.ResolvedAt || null,
+          };
+        });
+        setPendingDiscrepancies(mappedDiscrepancies as any);
+      }
+
+      // 2. CARGA CRÍTICA DE TRASLADOS: Traemos TODOS (Para no perderlos al dar F5)
+      const { data: transfersData, error: transferError } = await supabase
+        .from('Read_Virtual_Transfers')
+        .select('*')
+        .eq('MissionId', activeMissionId)
+        .order('CreatedAt', { ascending: false });
+
+      if (transferError) {
+        console.warn('[TabFloorReconciliation] Error BD Traslados:', transferError);
+      } else if (transfersData) {
+        setVirtualTransfers(transfersData as VirtualTransfer[]);
+      }
+    } catch (err) {
+      console.error('[TabFloorReconciliation] Fallo sincronización:', err);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [activeMissionId, setPendingDiscrepancies, setVirtualTransfers]);
+
+  useEffect(() => {
+    fetchOpenDiscrepancies();
+  }, [fetchOpenDiscrepancies]);
+
+  // AL DAR CLIC EN VERIFICAR: Consulta la API en tiempo real
+  const handleSelectDiscrepancy = async (disc: FloorDiscrepancy) => {
+    setSelectedDiscrepancy(disc);
+    setFloorCountedInput('');
+    setFloorSystemInput('0'); // Valor por defecto
+    setIsFetchingLive(true);
+
+    try {
+      const res = await fetch(`https://192.168.15.225:3002/api/inventory?search=${disc.skuCode}`);
+      if (res.ok) {
+        const json = await res.json();
+        if (json.success && json.data) {
+          const targetItem = json.data.find((d: any) => d.codigo_deposito === disc.targetDeposit);
+          setFloorSystemInput(targetItem ? String(targetItem.stock_quantity) : '0');
+        }
+      } else {
+        // Fallback al valor teórico guardado si falla la API
+        setFloorSystemInput(String(disc.targetSystemQuantity || 0));
+      }
+    } catch (err) {
+      console.warn('Fallo API destino:', err);
+      setFloorSystemInput(String(disc.targetSystemQuantity || 0));
+    } finally {
+      setIsFetchingLive(false);
+    }
+  };
+
+  const currentOriginDisc = Number(selectedDiscrepancy?.originDiscrepancy || 0);
+  const floorCounted = parseFloat(floorCountedInput);
+  const isFloorCountValid = !isNaN(floorCounted) && floorCounted >= 0;
+  const floorSystem = parseFloat(floorSystemInput) || 0;
+  const targetDiscrepancyVal = isFloorCountValid ? floorCounted - floorSystem : 0;
+
+  // Lógica Matemática de Interfaz
+  let transferQuantity = 0;
+  if (currentOriginDisc < 0 && targetDiscrepancyVal > 0) {
+    transferQuantity = Math.min(Math.abs(currentOriginDisc), targetDiscrepancyVal);
+  } else if (currentOriginDisc > 0 && targetDiscrepancyVal < 0) {
+    transferQuantity = Math.min(currentOriginDisc, Math.abs(targetDiscrepancyVal));
+  }
+
+  // --- EJECUCIÓN DEL CONTEO ---
+  const handleConfirmReconciliation = async () => {
+    if (!selectedDiscrepancy || !activeMissionId || !isFloorCountValid || !user) {
+      showToast('Ingrese un conteo válido', 'error');
+      return;
+    }
+
+    setIsSubmitting(true);
+    const discId = selectedDiscrepancy.discrepancyId || '';
+    const skuCode = selectedDiscrepancy.skuCode || '';
+    const skuDesc = selectedDiscrepancy.skuDescription || '';
+
+    // Tu lógica de objeto virtual para la UI
+    let virtualTransfer: VirtualTransfer | undefined;
+    if (transferQuantity > 0) {
+      virtualTransfer = {
+        TransferId: crypto.randomUUID ? crypto.randomUUID() : `trans_${Date.now()}`,
+        MissionId: activeMissionId,
+        TaskId: selectedDiscrepancy.taskId || '',
+        SkuCode: skuCode,
+        SkuDescription: skuDesc,
+        OriginDeposit: selectedDiscrepancy.originDeposit || '150101',
+        DestinationDeposit: selectedDiscrepancy.targetDeposit || '150103',
+        TransferredQuantity: transferQuantity,
+        CreatedAt: new Date().toISOString(),
+        Status: 'SUGGESTED',
+      };
+    }
+
+    // Payload de la BD
+    const payload = {
+      discrepancy_id: discId,
+      mission_id: activeMissionId,
+      sku_code: skuCode,
+      sku_description: skuDesc,
+      origin_deposit: selectedDiscrepancy.originDeposit || '150101',
+      target_deposit: selectedDiscrepancy.targetDeposit || '150103',
+      warehouse_discrepancy: currentOriginDisc,
+      origin_discrepancy: currentOriginDisc,
+      floor_counted_qty: floorCounted,
+      target_counted_quantity: floorCounted,
+      floor_system_qty: floorSystem,
+      target_system_quantity: floorSystem,
+      sales_during_audit: 0,
+      user_id: user.id,
+    };
+
+    try {
+      if (isOnline && isSupabaseConfigured) {
+        const { error } = await supabase.functions.invoke('register-floor-count', { body: payload });
+        if (error) {
+          // Fallback a Base de datos directo si falla la Edge Function
+          await supabase
+            .from('Read_Floor_Discrepancies')
+            .update({
+              TargetCountedQuantity: floorCounted,
+              TargetDiscrepancy: targetDiscrepancyVal,
+              Status: transferQuantity > 0 ? 'PENDING_TRANSFER_APPROVAL' : 'RESOLVED',
+              UpdatedAt: new Date().toISOString(),
+            })
+            .eq('DiscrepancyId', discId);
+        }
+      } else {
+        await enqueueOfflineEvent({
+          type: 'register-floor-count',
+          missionId: activeMissionId,
+          discrepancyId: discId,
+          payload,
+        });
+      }
+
+      resolveDiscrepancyLocally(discId, floorCounted, virtualTransfer);
+      showToast(
+        transferQuantity > 0
+          ? `Reconciliado: Traslado sugerido de ${transferQuantity.toFixed(2)} u`
+          : `Conteo registrado sin traslados.`,
+        'success'
+      );
+      setSelectedDiscrepancy(null);
+      setFloorCountedInput('');
+
+      // Esperar un segundo y forzar la recarga de todo
+      setTimeout(async () => {
+        await fetchOpenDiscrepancies();
+        if (activeMissionId) fetchMissionTasks(activeMissionId);
+      }, 1000);
+    } catch (err) {
+      showToast('Error al registrar reconciliación', 'error');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  // --- CONFIRMACIÓN HUMANA DEL TRASLADO (VÍA EVENTSTORE DIRECTO) ---
+  const handleApproveTransfer = async (transfer: any) => {
+    const transferQty = transfer.TransferQuantity || transfer.TransferredQuantity || 0;
+    const isConfirmed = window.confirm(
+      `¿ESTÁS SEGURO QUE ESTE TRASLADO SE REALIZÓ EN EL ERP?\n\nSKU: ${
+        transfer.SkuCode || transfer.skuCode
+      }\nCantidad: ${transferQty} u\nDe: ${transfer.FromDeposit || transfer.OriginDeposit} -> A: ${
+        transfer.ToDeposit || transfer.DestinationDeposit
+      }`
+    );
+
+    if (!isConfirmed) return;
+
+    const transferIdToConfirm = transfer.TransferId || transfer.transferId;
+    const missionId = transfer.MissionId || transfer.missionId;
+    const skuCode = transfer.SkuCode || transfer.skuCode;
+    
+    setIsSubmitting(true);
+
+    try {
+      // 1. Actualización Optimista Visual Inmediata
+      setVirtualTransfers(
+        virtualTransfers.map((t) =>
+          (t.TransferId || (t as any).transferId) === transferIdToConfirm
+            ? { ...t, Status: 'COMPLETED', status: 'COMPLETED' } as any
+            : t
+        )
+      );
+
+      // Generador de UUID nativo para cumplir con la arquitectura estricta del EventStore
+      const generateUUID = () => {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+          const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+          return v.toString(16);
+        });
+      };
+
+      // 2. INSERCIÓN DIRECTA EN EL EVENTSTORE (Cumpliendo esquema estricto CQRS)
+      const { error: eventError } = await supabase.from('EventStore').insert({
+        EventId: generateUUID(),
+        EventType: 'VirtualTransferExecuted',
+        AggregateId: transferIdToConfirm,
+        AggregateType: 'VirtualTransfer',
+        UserId: user?.id || '00000000-0000-0000-0000-000000000000',
+        CorrelationId: generateUUID(), // CAMPO OBLIGATORIO PARA SUPERAR RESTRICCIÓN
+        Version: 1, // CAMPO OBLIGATORIO
+        Metadata: { appVersion: '1.0.0', source: 'TabFloorReconciliation' }, // CAMPO OBLIGATORIO
+        Payload: {
+          transfer_id: transferIdToConfirm,
+          mission_id: missionId,
+          sku_code: skuCode,
+          sku_description: transfer.SkuDescription || transfer.skuDescription || 'Artículo',
+          transfer_quantity: transferQty,
+          from_deposit: transfer.FromDeposit || transfer.OriginDeposit,
+          to_deposit: transfer.ToDeposit || transfer.DestinationDeposit
+        }
+      });
+
+      if (eventError) {
+        console.error('Error insertando en EventStore:', eventError);
+        // Fallback secundario directo a la tabla si el EventStore tuviera RLS activado
+        const { error: dbError } = await supabase
+          .from('Read_Virtual_Transfers')
+          .update({ Status: 'COMPLETED', UpdatedAt: new Date().toISOString() })
+          .eq('TransferId', transferIdToConfirm);
+
+        if (dbError) throw dbError;
+      }
+
+      showToast('Traslado confirmado exitosamente en el ERP.', 'success');
+
+      // 3. Refrescar vistas para sincronizar la matemática en Reportes
+      setTimeout(async () => {
+        await fetchOpenDiscrepancies();
+        if (activeMissionId) fetchMissionTasks(activeMissionId);
+      }, 1000);
+      
+    } catch (err) {
+      console.error('Error aprobando traslado:', err);
+      showToast('Error al confirmar el traslado. Revisa la consola.', 'error');
+      await fetchOpenDiscrepancies(); // Rollback visual si algo falló
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const showToast = (text: string, type: 'success' | 'warning' | 'error') => {
+    setToast({ text, type });
+    setTimeout(() => setToast(null), 4000);
+  };
+
+  const filteredDiscrepancies = pendingFloorDiscrepancies.filter((d) => {
+    const q = filterQuery.toLowerCase().trim();
+    if (!q) return true;
+    return (d.skuCode || '').toLowerCase().includes(q) || (d.skuDescription || '').toLowerCase().includes(q);
+  });
+
+  // FILTRO ESTRICTO: Solo mostrar "SUGGESTED" en la tabla de Pendientes de Confirmación (Previene F5 bug)
+  const pendingSuggestedTransfers = virtualTransfers.filter(
+    (tr: any) => tr.Status === 'SUGGESTED' || tr.status === 'SUGGESTED'
+  );
+
+  return (
+    <div className="space-y-5 max-w-4xl mx-auto w-full pb-8">
+      {/* HEADER DE INSTRUCCIONES */}
+      <div className="bg-white border border-[#E5E7EB] rounded-[12px] p-4 sm:p-5 card-elevation text-[#1F2937]">
+        <div className="flex items-start gap-3">
+          <div className="p-2.5 bg-[#263988]/10 rounded-[8px] text-[#263988] shrink-0">
+            <Store className="w-6 h-6" />
+          </div>
+          <div className="space-y-1">
+            <h2 className="text-base sm:text-lg font-black text-[#263988] tracking-tight flex items-center gap-2">
+              <span>Reconciliación Asíncrona: Validación de Destino</span>
+            </h2>
+            <p className="text-xs sm:text-sm text-[#6B7280] leading-relaxed">
+              Los artículos listados abajo presentaron diferencias al auditar en origen. Verifique físicamente el destino para compensar automáticamente. Los traslados generados requerirán confirmación manual del administrador.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex flex-col sm:flex-row gap-2.5 items-stretch sm:items-center justify-between">
+        <div className="relative flex-1">
+          <Search className="w-4 h-4 text-[#6B7280] absolute left-3.5 top-1/2 -translate-y-1/2" />
+          <input
+            type="text"
+            value={filterQuery}
+            onChange={(e) => setFilterQuery(e.target.value)}
+            placeholder="Filtrar por SKU o descripción..."
+            className="w-full h-11 pl-10 pr-3 bg-white border border-[#E5E7EB] rounded-[8px] text-[#1F2937] font-mono text-sm focus:border-[#009045] focus:outline-hidden"
+          />
+        </div>
+        <button
+          onClick={fetchOpenDiscrepancies}
+          disabled={isLoading}
+          className="btn-collector bg-white hover:bg-[#F8F9FA] text-[#1F2937] px-4 rounded-[8px] text-xs font-bold flex items-center justify-center gap-2 min-h-[44px] border border-[#E5E7EB]"
+        >
+          <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin text-[#263988]' : ''}`} />
+          <span>Refrescar Lista</span>
+        </button>
+      </div>
+
+      {/* FORMULARIO ACTIVO (Si hay un item seleccionado) */}
+      {selectedDiscrepancy && (
+        <div className="bg-white border-2 border-[#263988] rounded-[12px] p-4 sm:p-6 card-elevation space-y-4 animate-fadeIn">
+          <div className="flex items-start justify-between pb-3 border-b border-[#E5E7EB]">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-mono font-black bg-[#263988]/10 text-[#263988] px-2.5 py-0.5 rounded-full border border-[#263988]/20">
+                  SKU: {selectedDiscrepancy.skuCode}
+                </span>
+                <span
+                  className={`text-xs font-semibold px-2.5 py-0.5 rounded-full border ${
+                    currentOriginDisc < 0
+                      ? 'text-[#DC2626] bg-red-50 border-[#DC2626]/20'
+                      : 'text-[#263988] bg-[#263988]/10 border-[#263988]/20'
+                  }`}
+                >
+                  {currentOriginDisc < 0 ? 'Faltante Origen' : 'Sobrante Origen'}:{' '}
+                  {currentOriginDisc > 0 ? `+${currentOriginDisc.toFixed(2)}` : currentOriginDisc.toFixed(2)} u
+                </span>
+              </div>
+              <h3 className="text-lg sm:text-xl font-black text-[#1F2937] mt-1.5 leading-tight">
+                {selectedDiscrepancy.skuDescription}
+              </h3>
+            </div>
+            <button
+              onClick={() => setSelectedDiscrepancy(null)}
+              className="p-1.5 bg-[#F8F9FA] hover:bg-[#E5E7EB] text-[#1F2937] rounded-[8px] text-xs"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-bold text-[#1F2937] mb-1.5 uppercase tracking-wider">
+                CONTADO EN DESTINO ({selectedDiscrepancy.targetDeposit}):
+              </label>
+              <input
+                type="number"
+                step="any"
+                min="0"
+                value={floorCountedInput}
+                onChange={(e) => setFloorCountedInput(e.target.value)}
+                disabled={isFetchingLive}
+                placeholder="0.00"
+                className="w-full h-16 px-4 bg-[#F8F9FA] border-2 border-[#009045] rounded-[8px] text-[#1F2937] font-mono text-3xl font-black text-center disabled:opacity-50 focus:outline-hidden"
+                autoFocus
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-[#6B7280] mb-1.5 uppercase tracking-wider flex justify-between">
+                <span>TEÓRICO ERP ({selectedDiscrepancy.targetDeposit}):</span>
+                {isFetchingLive && <RefreshCw className="w-4 h-4 animate-spin text-[#263988]" />}
+              </label>
+              <div className="w-full h-16 flex items-center justify-center bg-[#F8F9FA] border border-[#E5E7EB] rounded-[8px]">
+                <span
+                  className={`font-mono text-3xl font-black ${
+                    isFetchingLive ? 'text-[#6B7280]' : 'text-[#1F2937]'
+                  }`}
+                >
+                  {isFetchingLive ? '...' : floorSystemInput}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex gap-2 pt-2">
+            <button
+              onClick={() => setSelectedDiscrepancy(null)}
+              className="btn-collector bg-[#F8F9FA] hover:bg-[#E5E7EB] text-[#1F2937] min-h-[52px] px-5 rounded-[8px] font-bold text-sm border border-[#E5E7EB]"
+            >
+              Cancelar
+            </button>
+            <button
+              onClick={handleConfirmReconciliation}
+              disabled={!isFloorCountValid || isSubmitting || isFetchingLive}
+              className="btn-collector flex-1 bg-[#009045] hover:bg-[#007a3a] disabled:opacity-50 text-white min-h-[52px] rounded-[8px] font-black flex items-center justify-center gap-2 transition active:scale-95 shadow-sm"
+            >
+              {isSubmitting ? (
+                <RefreshCw className="w-5 h-5 animate-spin" />
+              ) : (
+                <CheckCircle2 className="w-5 h-5" />
+              )}{' '}
+              VALIDAR DESTINO
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* LISTA DE PENDIENTES POR VERIFICAR EN DESTINO */}
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h3 className="text-xs sm:text-sm font-black text-[#1F2937] uppercase tracking-wider flex items-center gap-2">
+            <Layers className="w-4 h-4 text-[#263988]" />
+            <span>Pendientes por Verificar ({filteredDiscrepancies.length})</span>
+          </h3>
+        </div>
+
+        {filteredDiscrepancies.length === 0 ? (
+          <div className="bg-white border-2 border-dashed border-[#E5E7EB] rounded-[12px] p-10 text-center text-[#6B7280] space-y-2 card-elevation">
+            <CheckCircle2 className="w-12 h-12 mx-auto text-[#009045]" />
+            <p className="text-base font-bold text-[#1F2937]">No hay discrepancias pendientes</p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {filteredDiscrepancies.map((disc) => {
+              const originDisc = Number(disc.originDiscrepancy || 0);
+              const isFaltante = originDisc < 0;
+              const isSelected = disc.discrepancyId === selectedDiscrepancy?.discrepancyId;
+
+              return (
+                <div
+                  key={disc.discrepancyId}
+                  className={`bg-white border rounded-[12px] p-4 card-elevation transition ${
+                    isSelected
+                      ? 'border-2 border-[#263988]'
+                      : 'border-[#E5E7EB]'
+                  }`}
+                >
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-[10px] font-semibold text-[#6B7280]">
+                          Origen: {disc.originDeposit} &rarr; Destino: {disc.targetDeposit}
+                        </span>
+                      </div>
+                      <h4 className="text-base font-bold text-[#1F2937] tracking-tight leading-tight">
+                        {disc.skuDescription}
+                      </h4>
+                    </div>
+
+                    <div className="flex items-center gap-3 justify-between sm:justify-end shrink-0">
+                      <div className="bg-[#F8F9FA] border border-[#E5E7EB] px-3 py-2 rounded-[8px] text-right">
+                        <span className="text-[10px] uppercase font-bold text-[#6B7280] block">
+                          {isFaltante ? 'Faltante Origen' : 'Sobrante Origen'}
+                        </span>
+                        <span
+                          className={`text-base font-mono font-black ${
+                            isFaltante ? 'text-[#DC2626]' : 'text-[#263988]'
+                          }`}
+                        >
+                          {originDisc > 0 ? `+${originDisc.toFixed(2)}` : originDisc.toFixed(2)} u
+                        </span>
+                      </div>
+
+                      <button
+                        onClick={() => handleSelectDiscrepancy(disc as FloorDiscrepancy)}
+                        className="btn-collector bg-[#009045] hover:bg-[#007a3a] text-white min-h-[48px] px-4 rounded-[8px] font-bold text-xs sm:text-sm flex items-center gap-1.5 shrink-0 shadow-xs"
+                      >
+                        <span>Verificar</span>
+                        <ArrowRight className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* NUEVA TABLA: TRASLADOS SUGERIDOS PARA APROBACIÓN MANUAL */}
+      <div className="space-y-3 pt-6 border-t border-[#E5E7EB]">
+        <h3 className="text-xs font-black text-[#263988] uppercase tracking-widest flex items-center gap-2">
+          <ArrowRightLeft className="w-4 h-4" /> TRASLADOS PENDIENTES DE CONFIRMACIÓN (
+          {pendingSuggestedTransfers.length})
+        </h3>
+
+        {pendingSuggestedTransfers.length === 0 ? (
+          <div className="p-6 bg-white border border-[#E5E7EB] rounded-[12px] text-center text-[#6B7280] text-sm card-elevation">
+            No hay movimientos sugeridos esperando confirmación.
+          </div>
+        ) : (
+          pendingSuggestedTransfers.map((tr: any) => (
+            <div
+              key={tr.TransferId || tr.transferId}
+              className="bg-white border border-[#E5E7EB] rounded-[12px] p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 card-elevation"
+            >
+              <div>
+                <span className="text-[10px] font-black bg-[#263988]/10 text-[#263988] px-2 py-0.5 rounded-full border border-[#263988]/20">
+                  MOVIMIENTO SUGERIDO PARA CUADRAR
+                </span>
+                <h4 className="text-sm font-black text-[#1F2937] mt-1.5 leading-tight">
+                  {tr.SkuDescription || tr.skuDescription || 'Producto'}
+                </h4>
+                <div className="flex items-center gap-2 mt-2 text-[11px] text-[#6B7280] font-mono font-bold">
+                  <span>
+                    Mover {tr.TransferQuantity || tr.TransferredQuantity || tr.transferredQuantity} u
+                  </span>
+                  <span className="bg-[#F8F9FA] px-1.5 py-0.5 rounded-[8px] border border-[#E5E7EB] text-[#1F2937]">
+                    De: {tr.FromDeposit || tr.OriginDeposit || tr.originDeposit}
+                  </span>
+                  <ArrowRightLeft className="w-3 h-3 text-[#263988]" />
+                  <span className="bg-[#F8F9FA] px-1.5 py-0.5 rounded-[8px] border border-[#E5E7EB] text-[#1F2937]">
+                    A: {tr.ToDeposit || tr.DestinationDeposit || tr.destinationDeposit}
+                  </span>
+                </div>
+              </div>
+              <button
+                onClick={() => handleApproveTransfer(tr)}
+                className="bg-[#263988] hover:bg-[#1d2c6b] text-white px-5 py-2.5 rounded-[8px] font-black text-sm flex items-center justify-center gap-2 active:scale-95 transition shadow-xs w-full sm:w-auto shrink-0"
+              >
+                <CheckCircle2 className="w-4 h-4" /> CONFIRMAR ERP
+              </button>
+            </div>
+          ))
+        )}
+      </div>
+
+      {/* TOAST FLOTANTE */}
+      {toast && (
+        <div
+          className={`fixed bottom-20 left-1/2 -translate-x-1/2 z-50 px-4 py-3 rounded-[12px] modal-elevation text-xs sm:text-sm font-bold flex items-center gap-2.5 max-w-md w-[90%] border bg-white text-[#1F2937] animate-slideUp ${
+            toast.type === 'success'
+              ? 'border-[#009045]'
+              : toast.type === 'warning'
+              ? 'border-[#F59E0B]'
+              : 'border-[#DC2626]'
+          }`}
+        >
+          {toast.type === 'success' && <CheckCircle2 className="w-5 h-5 text-[#009045] shrink-0" />}
+          {toast.type === 'warning' && <AlertTriangle className="w-5 h-5 text-[#F59E0B] shrink-0" />}
+          {toast.type === 'error' && <X className="w-5 h-5 text-[#DC2626] shrink-0" />}
+          <span>{toast.text}</span>
+        </div>
+      )}
+    </div>
+  );
+};
