@@ -4,7 +4,7 @@
  * Descarga de flujo binario PDF directo desde Supabase Edge Function `reports-pdf`.
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   FileText,
   Download,
@@ -19,12 +19,22 @@ import {
   Table,
   Layers,
   ArrowRight,
-  ExternalLink
+  ExternalLink,
+  FileSpreadsheet,
+  Filter,
+  Search,
+  X,
+  SlidersHorizontal,
+  Check
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured, supabaseAnonKey, supabaseUrl } from '../lib/supabase';
 import { useMissionStore } from '../store/useMissionStore';
 import { useDiscrepancyStore } from '../stores/useDiscrepancyStore';
 import { VirtualTransfer, MissionTask } from '../types/audit';
+import { exportTasksToExcel, ExcelExportMode } from '../lib/exportExcel';
+
+type DifferenceFilter = 'ALL' | 'MISSING' | 'SURPLUS' | 'EXACT';
+type StatusFilter = 'ALL' | 'PENDING' | 'COMPLETED_MATCH' | 'DISCREPANCY_FOUND' | 'RECONCILED' | 'PARTIALLY_RECONCILED';
 
 export const TabReports: React.FC = () => {
   const { activeMissionId, activeMission, metrics, tasks } = useMissionStore();
@@ -32,7 +42,14 @@ export const TabReports: React.FC = () => {
 
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isDownloadingPdf, setIsDownloadingPdf] = useState<boolean>(false);
+  const [isExportingExcel, setIsExportingExcel] = useState<boolean>(false);
+  const [showExportModal, setShowExportModal] = useState<boolean>(false);
   const [toast, setToast] = useState<{ text: string; type: 'success' | 'warning' | 'error' } | null>(null);
+
+  // Estados de filtrado reactivo para Detalle de Tareas
+  const [differenceFilter, setDifferenceFilter] = useState<DifferenceFilter>('ALL');
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL');
+  const [taskSearchQuery, setTaskSearchQuery] = useState<string>('');
 
   // 1. Cargar traslados virtuales de la misión activa
   const fetchTransfers = useCallback(async () => {
@@ -77,7 +94,112 @@ export const TabReports: React.FC = () => {
     ? Math.round((reconciledSkus / (discrepantSkus + reconciledSkus)) * 100)
     : 100;
 
-  // 2. Descargar Reporte PDF Oficial vía Edge Function `reports-pdf`
+  // 2. Conteo reactivo de tareas por diferencia para los badges de los filtros
+  const missingTasksCount = useMemo(() => {
+    return tasks.filter((t) => Number(t.Discrepancy ?? 0) < 0).length;
+  }, [tasks]);
+
+  const surplusTasksCount = useMemo(() => {
+    return tasks.filter((t) => Number(t.Discrepancy ?? 0) > 0).length;
+  }, [tasks]);
+
+  const exactTasksCount = useMemo(() => {
+    return tasks.filter((t) => {
+      const isCounted = t.CountedQuantity !== null && t.CountedQuantity !== undefined;
+      return isCounted && Number(t.Discrepancy ?? 0) === 0;
+    }).length;
+  }, [tasks]);
+
+  // 3. Tareas filtradas reactivamente por Diferencia, Estado y Búsqueda
+  const filteredTasks = useMemo(() => {
+    return tasks.filter((task) => {
+      const disc = Number(task.Discrepancy ?? 0);
+      const isCounted = task.CountedQuantity !== null && task.CountedQuantity !== undefined;
+
+      // Filtro por Diferencia
+      if (differenceFilter === 'MISSING' && disc >= 0) return false;
+      if (differenceFilter === 'SURPLUS' && disc <= 0) return false;
+      if (differenceFilter === 'EXACT' && (!isCounted || disc !== 0)) return false;
+
+      // Filtro por Estado
+      if (statusFilter !== 'ALL') {
+        if (statusFilter === 'DISCREPANCY_FOUND') {
+          if (task.Status !== 'DISCREPANT' && disc === 0) return false;
+        } else if (task.Status !== statusFilter) {
+          return false;
+        }
+      }
+
+      // Filtro de Búsqueda de Texto (SKU o Descripción)
+      if (taskSearchQuery.trim()) {
+        const q = taskSearchQuery.toLowerCase().trim();
+        const sku = (task.SkuCode || task.skuCode || '').toLowerCase();
+        const desc = (task.SkuDescription || task.skuDescription || '').toLowerCase();
+        if (!sku.includes(q) && !desc.includes(q)) return false;
+      }
+
+      return true;
+    });
+  }, [tasks, differenceFilter, statusFilter, taskSearchQuery]);
+
+  const hasActiveFilters = differenceFilter !== 'ALL' || statusFilter !== 'ALL' || taskSearchQuery.trim() !== '';
+
+  const clearAllFilters = () => {
+    setDifferenceFilter('ALL');
+    setStatusFilter('ALL');
+    setTaskSearchQuery('');
+  };
+
+  const appliedFiltersSummary = useMemo(() => {
+    const parts: string[] = [];
+    if (differenceFilter === 'MISSING') parts.push('Solo Faltantes');
+    else if (differenceFilter === 'SURPLUS') parts.push('Solo Sobrantes');
+    else if (differenceFilter === 'EXACT') parts.push('Solo Cuadrados');
+    else parts.push('Todas las diferencias');
+
+    if (statusFilter === 'PENDING') parts.push('Estado: Pendientes');
+    else if (statusFilter === 'COMPLETED_MATCH') parts.push('Estado: Coincidencia Exacta');
+    else if (statusFilter === 'DISCREPANCY_FOUND') parts.push('Estado: Discrepancias');
+    else if (statusFilter === 'RECONCILED') parts.push('Estado: Trasladados');
+    else if (statusFilter === 'PARTIALLY_RECONCILED') parts.push('Estado: Traslado Parcial');
+
+    if (taskSearchQuery.trim()) parts.push(`Búsqueda: "${taskSearchQuery.trim()}"`);
+
+    return parts.join(' | ');
+  }, [differenceFilter, statusFilter, taskSearchQuery]);
+
+  // 4. Manejador de Exportación Excel Estilizado
+  const handleExportExcel = async (exportMode: ExcelExportMode) => {
+    if (filteredTasks.length === 0) {
+      showToast('No hay tareas que coincidan con los filtros seleccionados', 'warning');
+      return;
+    }
+
+    setIsExportingExcel(true);
+    setShowExportModal(false);
+    showToast('Generando archivo Excel estilizado...', 'success');
+
+    try {
+      await exportTasksToExcel({
+        missionId: activeMissionId || 'Mision_Auditoria',
+        missionName: activeMission?.name || 'Auditoría General',
+        depositCode: (activeMission?.depositCode || activeMission?.DepositCode || '150101') as string,
+        tasks: filteredTasks,
+        metrics,
+        mode: exportMode,
+        appliedFiltersDesc: appliedFiltersSummary
+      });
+
+      showToast(`Excel descargado con éxito (${filteredTasks.length} SKUs exportados)`, 'success');
+    } catch (err) {
+      console.error('Error generando archivo Excel:', err);
+      showToast('Ocurrió un error al generar el archivo Excel', 'error');
+    } finally {
+      setIsExportingExcel(false);
+    }
+  };
+
+  // 5. Descargar Reporte PDF Oficial vía Edge Function `reports-pdf`
   const handleDownloadPdf = async () => {
     if (!activeMissionId) {
       showToast('Seleccione primero una misión activa para emitir su reporte', 'warning');
@@ -102,12 +224,10 @@ export const TabReports: React.FC = () => {
         throw new Error(`Edge Function respondió con status ${response.status}: ${response.statusText}`);
       }
 
-      // Convertir el stream binario en Blob application/pdf
       const blob = await response.blob();
       const pdfBlob = new Blob([blob], { type: 'application/pdf' });
       const downloadUrl = window.URL.createObjectURL(pdfBlob);
 
-      // Disparar descarga automática en navegador
       const link = document.createElement('a');
       link.href = downloadUrl;
       link.download = `AUDITORIAPLUS_Reporte_${activeMissionId.slice(0, 8)}.pdf`;
@@ -115,22 +235,20 @@ export const TabReports: React.FC = () => {
       link.click();
       document.body.removeChild(link);
 
-      // Liberar memoria del objeto URL
       setTimeout(() => {
         window.URL.revokeObjectURL(downloadUrl);
       }, 2000);
 
       showToast('Reporte PDF descargado con éxito', 'success');
     } catch (err) {
-      console.warn('[TabReports] Fallo al invocar Edge Function reports-pdf, usando fallback de impresión:', err);
-      // Fallback: Si la Edge Function no está desplegada en la nube, abrir ventana de impresión estructurada
-      generateLocalPrintableReport();
+      console.warn('[TabReports] Fallo al invocar Edge Function reports-pdf, usando exportación Excel local:', err);
+      handleExportExcel('complete');
     } finally {
       setIsDownloadingPdf(false);
     }
   };
 
-  // Fallback de exportación imprimible local si la Edge Function no responde
+  // Fallback de exportación imprimible local aplicando los filtros activos
   const generateLocalPrintableReport = () => {
     const printWindow = window.open('', '_blank');
     if (!printWindow) {
@@ -166,13 +284,13 @@ export const TabReports: React.FC = () => {
         <div class="meta">
           <strong>Misión:</strong> ${activeMissionId} | 
           <strong>Fecha:</strong> ${new Date().toLocaleString()} | 
-          <strong>Depósito Auditado:</strong> 150101 Almacén Principal
+          <strong>Filtros aplicados:</strong> ${appliedFiltersSummary}
         </div>
 
         <div class="kpis">
           <div class="kpi-box">
-            <div class="kpi-title">SKUs Auditados</div>
-            <div class="kpi-val">${countedSkus} / ${totalSkus} (${auditAccuracyPercent}%)</div>
+            <div class="kpi-title">SKUs Mostrados</div>
+            <div class="kpi-val">${filteredTasks.length} / ${tasks.length}</div>
           </div>
           <div class="kpi-box">
             <div class="kpi-title">Discrepancias</div>
@@ -188,7 +306,7 @@ export const TabReports: React.FC = () => {
           </div>
         </div>
 
-        <h3>Detalle de Tareas de Auditoría (${tasks.length} SKUs)</h3>
+        <h3>Detalle de Tareas Filtradas (${filteredTasks.length} SKUs)</h3>
         <table>
           <thead>
             <tr>
@@ -203,7 +321,7 @@ export const TabReports: React.FC = () => {
             </tr>
           </thead>
           <tbody>
-            ${tasks.map((t) => {
+            ${filteredTasks.map((t) => {
               const disc = Number(t.Discrepancy ?? 0);
               let displayStatus: string = t.Status;
               if (t.Status === 'RECONCILED') displayStatus = 'TRASLADADO';
@@ -212,7 +330,8 @@ export const TabReports: React.FC = () => {
               return `
               <tr>
                 <td><strong>${t.SkuCode}</strong></td>
-                <td>${t.SkuDescription}</td>                 <td>$${Number(t.Cost || 0).toFixed(2)}</td>
+                <td>${t.SkuDescription}</td>
+                <td>$${Number(t.Cost || 0).toFixed(2)}</td>
                 <td>${Number(t.SystemQuantity || 0).toFixed(2)}</td>
                 <td>${Number(t.SalesDuringAudit || 0).toFixed(2)}</td>
                 <td>${t.CountedQuantity !== null && t.CountedQuantity !== undefined ? Number(t.CountedQuantity).toFixed(2) : '-'}</td>
@@ -456,91 +575,333 @@ export const TabReports: React.FC = () => {
         )}
       </div>
 
-      {/* 4. LISTADO RÁPIDO DE TODAS LAS TAREAS DE LA MISIÓN */}
+      {/* 4. LISTADO RÁPIDO Y FILTRADO DE TAREAS DE LA MISIÓN */}
       {tasks.length > 0 && (
-        <div className="bg-white border border-[#E5E7EB] rounded-[12px] p-4 sm:p-5 card-elevation space-y-3">
-          <div className="flex items-center justify-between">
-            <h3 className="text-xs sm:text-sm font-black text-[#1F2937] uppercase tracking-wider flex items-center gap-2">
-              <Table className="w-4 h-4 text-[#263988]" />
-              <span>Detalle de Tareas de Inventario ({tasks.length} SKUs)</span>
-            </h3>
-            <button
-              onClick={generateLocalPrintableReport}
-              className="text-xs text-[#263988] hover:text-[#009045] font-semibold flex items-center gap-1 transition"
-            >
-              <Printer className="w-3.5 h-3.5" />
-              <span>Imprimir Ficha Completa</span>
-            </button>
+        <div className="bg-white border border-[#E5E7EB] rounded-[12px] p-4 sm:p-5 card-elevation space-y-4">
+          {/* Header con título y botón de Exportar Excel */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <h3 className="text-xs sm:text-sm font-black text-[#1F2937] uppercase tracking-wider flex items-center gap-2">
+                <Table className="w-4 h-4 text-[#263988]" />
+                <span>Detalle de Tareas de Inventario</span>
+              </h3>
+              <p className="text-xs text-[#6B7280] mt-0.5">
+                Mostrando <strong className="text-[#1F2937]">{filteredTasks.length}</strong> de <strong className="text-[#1F2937]">{tasks.length}</strong> SKUs
+                {hasActiveFilters && (
+                  <span className="text-[#009045] font-semibold ml-1.5">(Filtros activos)</span>
+                )}
+              </p>
+            </div>
+
+            {/* BOTÓN REEMPLAZADO: EXPORTAR EXCEL ESTILIZADO */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setShowExportModal(true)}
+                disabled={isExportingExcel || filteredTasks.length === 0}
+                className="btn-collector bg-[#009045] hover:bg-[#007a3a] disabled:opacity-50 text-white min-h-[44px] px-4 rounded-[8px] text-xs font-black shadow-xs flex items-center gap-2 active:scale-95 transition"
+                title="Exportar archivo Excel estilizado con los filtros aplicados"
+              >
+                <FileSpreadsheet className={`w-4 h-4 ${isExportingExcel ? 'animate-spin' : ''}`} />
+                <span>{isExportingExcel ? 'GENERANDO EXCEL...' : 'EXPORTAR EXCEL (.XLSX)'}</span>
+              </button>
+            </div>
           </div>
 
-          <div className="overflow-x-auto max-h-80 custom-scrollbar border border-[#E5E7EB] rounded-[8px]">
-            <table className="w-full text-left text-xs">
-              <thead className="bg-[#F8F9FA] text-[#6B7280] text-[10px] uppercase font-bold sticky top-0 border-b border-[#E5E7EB]">
-                <tr>
-                  <th className="py-2 px-3">SKU</th>
-                  <th className="py-2 px-3">Descripción</th>
-                  <th className="py-2 px-3 text-right">Sistema</th>
-                  <th className="py-2 px-3 text-right">Contado</th>
-                  <th className="py-2 px-3 text-right">Diferencia</th>
-                  <th className="py-2 px-3 text-center">Estado</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[#E5E7EB] bg-white">
-                {tasks.map((task) => {
-                  // Tomamos la verdad absoluta directo de la BD
-                  const disc = Number(task.Discrepancy ?? 0);
-                  const isCounted = task.CountedQuantity !== null && task.CountedQuantity !== undefined;
+          {/* BARRA DE HERRAMIENTAS DE FILTROS REACTIVOS */}
+          <div className="p-3 bg-[#F8F9FA] rounded-[8px] border border-[#E5E7EB] space-y-3">
+            <div className="flex flex-col lg:flex-row gap-2.5 items-stretch lg:items-center justify-between">
+              
+              {/* Filtro por Tipo de Diferencia */}
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[11px] font-bold text-[#6B7280] uppercase tracking-wider mr-1 flex items-center gap-1">
+                  <Filter className="w-3.5 h-3.5 text-[#263988]" /> Diferencia:
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setDifferenceFilter('ALL')}
+                  className={`px-2.5 py-1 text-xs font-bold rounded-[8px] transition ${
+                    differenceFilter === 'ALL'
+                      ? 'bg-[#263988] text-white shadow-xs'
+                      : 'bg-white text-[#1F2937] border border-[#E5E7EB] hover:bg-[#F8F9FA]'
+                  }`}
+                >
+                  Todos ({tasks.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDifferenceFilter('MISSING')}
+                  className={`px-2.5 py-1 text-xs font-bold rounded-[8px] transition ${
+                    differenceFilter === 'MISSING'
+                      ? 'bg-[#DC2626] text-white shadow-xs'
+                      : 'bg-white text-[#DC2626] border border-[#DC2626]/30 hover:bg-red-50'
+                  }`}
+                >
+                  Faltantes (&lt;0) ({missingTasksCount})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDifferenceFilter('SURPLUS')}
+                  className={`px-2.5 py-1 text-xs font-bold rounded-[8px] transition ${
+                    differenceFilter === 'SURPLUS'
+                      ? 'bg-[#F59E0B] text-white shadow-xs'
+                      : 'bg-white text-[#F59E0B] border border-[#F59E0B]/30 hover:bg-amber-50'
+                  }`}
+                >
+                  Sobrantes (&gt;0) ({surplusTasksCount})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDifferenceFilter('EXACT')}
+                  className={`px-2.5 py-1 text-xs font-bold rounded-[8px] transition ${
+                    differenceFilter === 'EXACT'
+                      ? 'bg-[#009045] text-white shadow-xs'
+                      : 'bg-white text-[#009045] border border-[#009045]/30 hover:bg-emerald-50'
+                  }`}
+                >
+                  Cuadrados (=0) ({exactTasksCount})
+                </button>
+              </div>
 
-                  // Traducimos el estatus de la base de datos para la gerencia
-                  let displayStatus: string = task.Status;
-                  if (task.Status === 'RECONCILED') displayStatus = 'TRASLADADO';
-                  if (task.Status === 'PARTIALLY_RECONCILED') displayStatus = 'TRASLADO PARCIAL';
+              {/* Filtro por Estado y Búsqueda por SKU / Nombre */}
+              <div className="flex flex-wrap sm:flex-nowrap items-center gap-2">
+                <div className="w-full sm:w-auto">
+                  <select
+                    value={statusFilter}
+                    onChange={(e) => setStatusFilter(e.target.value as StatusFilter)}
+                    className="w-full sm:w-44 h-9 px-2.5 bg-white border border-[#E5E7EB] rounded-[8px] text-[#1F2937] text-xs font-semibold focus:border-[#009045] focus:outline-hidden"
+                  >
+                    <option value="ALL">Todos los Estados</option>
+                    <option value="PENDING">Pendientes de conteo</option>
+                    <option value="COMPLETED_MATCH">Coincidencia exacta</option>
+                    <option value="DISCREPANCY_FOUND">Con discrepancia</option>
+                    <option value="RECONCILED">Trasladados</option>
+                    <option value="PARTIALLY_RECONCILED">Traslado parcial</option>
+                  </select>
+                </div>
 
-                  return (
-                    <tr key={task.TaskId || task.taskId} className="hover:bg-[#F8F9FA] transition">
-                      <td className="py-2 px-3 font-mono font-bold text-[#1F2937]">
-                        {task.SkuCode || task.skuCode}
-                      </td>
-                      <td className="py-2 px-3 text-[#6B7280] truncate max-w-xs">
-                        {task.SkuDescription || task.skuDescription}
-                      </td>
-                      <td className="py-2 px-3 text-right font-mono text-[#1F2937]">
-                        {Number(task.SystemQuantity ?? 0).toFixed(2)}
-                      </td>
-                      <td className="py-2 px-3 text-right font-mono text-[#1F2937]">
-                        {isCounted ? Number(task.CountedQuantity).toFixed(2) : '-'}
-                      </td>
-                      <td className="py-2 px-3 text-right font-mono font-bold">
-                        <span
-                          className={
-                            disc === 0
-                              ? 'text-[#009045]'
-                              : disc < 0
-                              ? 'text-[#DC2626]'
-                              : 'text-[#F59E0B]'
-                          }
-                        >
-                          {disc === 0 ? '0.00' : disc > 0 ? `+${disc.toFixed(2)}` : disc.toFixed(2)}
-                        </span>
-                      </td>
-                      <td className="py-2 px-3 text-center">
-                        <span
-                          className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full border ${
-                            displayStatus === 'COMPLETED_MATCH' || displayStatus === 'TRASLADADO'
-                              ? 'bg-emerald-50 text-[#009045] border-[#009045]/30'
-                              : displayStatus === 'TRASLADO PARCIAL'
-                              ? 'bg-blue-50 text-[#263988] border-[#263988]/30'
-                              : 'bg-amber-50 text-[#F59E0B] border-[#F59E0B]/30'
-                          }`}
-                        >
-                          {displayStatus}
-                        </span>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                <div className="relative w-full sm:w-56">
+                  <Search className="w-3.5 h-3.5 text-[#6B7280] absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="text"
+                    value={taskSearchQuery}
+                    onChange={(e) => setTaskSearchQuery(e.target.value)}
+                    placeholder="Buscar SKU o nombre..."
+                    className="w-full h-9 pl-8 pr-7 bg-white border border-[#E5E7EB] rounded-[8px] text-[#1F2937] text-xs focus:border-[#009045] focus:outline-hidden"
+                  />
+                  {taskSearchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setTaskSearchQuery('')}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-[#6B7280] hover:text-[#1F2937]"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                {hasActiveFilters && (
+                  <button
+                    type="button"
+                    onClick={clearAllFilters}
+                    className="text-xs text-[#DC2626] hover:underline font-bold px-1 whitespace-nowrap"
+                  >
+                    Restablecer
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* TABLA DE TAREAS FILTRADAS */}
+          {filteredTasks.length === 0 ? (
+            <div className="p-8 bg-[#F8F9FA] border border-dashed border-[#E5E7EB] rounded-[8px] text-center space-y-2">
+              <Filter className="w-8 h-8 text-[#6B7280] mx-auto" />
+              <p className="text-sm font-bold text-[#1F2937]">No hay SKUs que coincidan con los filtros seleccionados</p>
+              <p className="text-xs text-[#6B7280]">
+                Pruebe cambiando el tipo de diferencia o el estado, o{' '}
+                <button
+                  type="button"
+                  onClick={clearAllFilters}
+                  className="text-[#263988] font-bold underline"
+                >
+                  restablezca todos los filtros
+                </button>
+                .
+              </p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto max-h-96 custom-scrollbar border border-[#E5E7EB] rounded-[8px]">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-[#F8F9FA] text-[#6B7280] text-[10px] uppercase font-bold sticky top-0 border-b border-[#E5E7EB]">
+                  <tr>
+                    <th className="py-2.5 px-3">SKU</th>
+                    <th className="py-2.5 px-3">Descripción</th>
+                    <th className="py-2.5 px-3 text-right">Sistema (S)</th>
+                    <th className="py-2.5 px-3 text-right">Contado (Qc)</th>
+                    <th className="py-2.5 px-3 text-right">Diferencia</th>
+                    <th className="py-2.5 px-3 text-center">Estado</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#E5E7EB] bg-white">
+                  {filteredTasks.map((task) => {
+                    const disc = Number(task.Discrepancy ?? 0);
+                    const isCounted = task.CountedQuantity !== null && task.CountedQuantity !== undefined;
+
+                    let displayStatus: string = task.Status;
+                    if (task.Status === 'RECONCILED') displayStatus = 'TRASLADADO';
+                    if (task.Status === 'PARTIALLY_RECONCILED') displayStatus = 'TRASLADO PARCIAL';
+                    if (task.Status === 'COMPLETED_MATCH') displayStatus = 'COINCIDENCIA EXACTA';
+                    if (task.Status === 'PENDING') displayStatus = 'PENDIENTE';
+                    if (task.Status === 'DISCREPANT') displayStatus = 'DISCREPANCIA';
+
+                    return (
+                      <tr key={task.TaskId || task.taskId} className="hover:bg-[#F8F9FA] transition">
+                        <td className="py-2.5 px-3 font-mono font-bold text-[#1F2937]">
+                          {task.SkuCode || task.skuCode}
+                        </td>
+                        <td className="py-2.5 px-3 text-[#6B7280] truncate max-w-xs">
+                          {task.SkuDescription || task.skuDescription}
+                        </td>
+                        <td className="py-2.5 px-3 text-right font-mono text-[#1F2937]">
+                          {Number(task.SystemQuantity ?? 0).toFixed(2)}
+                        </td>
+                        <td className="py-2.5 px-3 text-right font-mono text-[#1F2937]">
+                          {isCounted ? Number(task.CountedQuantity).toFixed(2) : '-'}
+                        </td>
+                        <td className="py-2.5 px-3 text-right font-mono font-bold">
+                          <span
+                            className={
+                              disc === 0
+                                ? 'text-[#009045]'
+                                : disc < 0
+                                ? 'text-[#DC2626]'
+                                : 'text-[#F59E0B]'
+                            }
+                          >
+                            {disc === 0 ? '0.00' : disc > 0 ? `+${disc.toFixed(2)}` : disc.toFixed(2)}
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-3 text-center">
+                          <span
+                            className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full border ${
+                              displayStatus === 'COINCIDENCIA EXACTA' || displayStatus === 'TRASLADADO'
+                                ? 'bg-emerald-50 text-[#009045] border-[#009045]/30'
+                                : displayStatus === 'TRASLADO PARCIAL'
+                                ? 'bg-blue-50 text-[#263988] border-[#263988]/30'
+                                : displayStatus === 'PENDIENTE'
+                                ? 'bg-[#F8F9FA] text-[#6B7280] border-[#E5E7EB]'
+                                : 'bg-amber-50 text-[#F59E0B] border-[#F59E0B]/30'
+                            }`}
+                          >
+                            {displayStatus}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* MODAL DE SELECCIÓN DE FORMATO EXCEL */}
+      {showExportModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs animate-fadeIn">
+          <div className="w-full max-w-md bg-white border border-[#E5E7EB] rounded-[12px] p-6 modal-elevation relative space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-[#E5E7EB]">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-[8px] bg-[#009045]/10 text-[#009045] flex items-center justify-center border border-[#009045]/20 shrink-0">
+                  <FileSpreadsheet className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-black text-[#1F2937] leading-snug">Exportar a Excel (.xlsx)</h3>
+                  <p className="text-[11px] text-[#6B7280]">{filteredTasks.length} SKUs filtrados para descarga</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowExportModal(false)}
+                className="p-1 text-[#6B7280] hover:text-[#1F2937] rounded-[8px]"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-2.5">
+              <p className="text-xs text-[#1F2937] font-semibold">Elija la modalidad de exportación:</p>
+
+              {/* Opción 1: Reporte Ejecutivo con KPIs */}
+              <button
+                type="button"
+                onClick={() => handleExportExcel('executive')}
+                disabled={isExportingExcel}
+                className="w-full text-left p-3.5 rounded-[8px] border border-[#E5E7EB] hover:border-[#009045] bg-[#F8F9FA] hover:bg-emerald-50/50 transition group cursor-pointer"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="space-y-0.5">
+                    <span className="text-xs font-black text-[#1F2937] group-hover:text-[#009045] flex items-center gap-1.5">
+                      📊 Hoja Única con KPIs y Tabla Estilizada
+                    </span>
+                    <p className="text-[11px] text-[#6B7280] leading-snug">
+                      Incluye banner corporativo, tarjetas de indicadores clave y tabla formateada con totales calculados.
+                    </p>
+                  </div>
+                  <Download className="w-4 h-4 text-[#6B7280] group-hover:text-[#009045] shrink-0 mt-0.5" />
+                </div>
+              </button>
+
+              {/* Opción 2: Tabla de Datos Directa */}
+              <button
+                type="button"
+                onClick={() => handleExportExcel('direct')}
+                disabled={isExportingExcel}
+                className="w-full text-left p-3.5 rounded-[8px] border border-[#E5E7EB] hover:border-[#263988] bg-[#F8F9FA] hover:bg-blue-50/50 transition group cursor-pointer"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="space-y-0.5">
+                    <span className="text-xs font-black text-[#1F2937] group-hover:text-[#263988] flex items-center gap-1.5">
+                      📑 Tabla de Datos Directa (Corporativa)
+                    </span>
+                    <p className="text-[11px] text-[#6B7280] leading-snug">
+                      Formato tabular optimizado con encabezados en azul marino y autofiltros activos, ideal para análisis y ERPs.
+                    </p>
+                  </div>
+                  <Download className="w-4 h-4 text-[#6B7280] group-hover:text-[#263988] shrink-0 mt-0.5" />
+                </div>
+              </button>
+
+              {/* Opción 3: Libro Completo (Ambas Hojas) */}
+              <button
+                type="button"
+                onClick={() => handleExportExcel('complete')}
+                disabled={isExportingExcel}
+                className="w-full text-left p-3.5 rounded-[8px] border border-[#263988]/30 hover:border-[#263988] bg-[#263988]/5 hover:bg-[#263988]/10 transition group cursor-pointer"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="space-y-0.5">
+                    <span className="text-xs font-black text-[#263988] flex items-center gap-1.5">
+                      📦 Libro Completo (Ambas Hojas)
+                    </span>
+                    <p className="text-[11px] text-[#6B7280] leading-snug">
+                      Genera ambas pestañas (*Resumen Ejecutivo* y *Datos Detallados*) en un solo archivo .xlsx.
+                    </p>
+                  </div>
+                  <Download className="w-4 h-4 text-[#263988] shrink-0 mt-0.5" />
+                </div>
+              </button>
+            </div>
+
+            <div className="pt-2 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowExportModal(false)}
+                className="btn-collector bg-[#F8F9FA] hover:bg-[#E5E7EB] text-[#1F2937] px-4 py-2 text-xs font-bold rounded-[8px] border border-[#E5E7EB]"
+              >
+                Cancelar
+              </button>
+            </div>
           </div>
         </div>
       )}
