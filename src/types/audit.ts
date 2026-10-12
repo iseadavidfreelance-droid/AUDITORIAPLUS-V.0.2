@@ -156,6 +156,10 @@ export interface RegisterCountPayload {
   sku_code: string;
   counted_quantity: number;
   sales_during_audit: number;
+  system_quantity?: number;
+  target_deposit?: string;
+  target_system_quantity?: number;
+  user_id?: string;
 }
 
 export interface RegisterFloorCountPayload {

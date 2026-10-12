@@ -82,14 +82,23 @@ async function dispatchEventToBackend(event: OfflineEventRecord): Promise<{ succ
       
       if (event.type === 'register-count') {
         const payload = event.payload as RegisterCountPayload;
-        const systemQty = 0; // Se actualiza el conteo físico
+        const updateData: Record<string, unknown> = {
+          CountedQuantity: payload.counted_quantity,
+          SalesDuringAudit: payload.sales_during_audit,
+          UpdatedAt: new Date().toISOString(),
+        };
+
+        if (payload.system_quantity !== undefined && payload.system_quantity !== null) {
+          updateData.SystemQuantity = payload.system_quantity;
+          const theoretical = payload.system_quantity - (payload.sales_during_audit || 0);
+          const discrepancy = Number((payload.counted_quantity - theoretical).toFixed(2));
+          updateData.Discrepancy = discrepancy;
+          updateData.Status = discrepancy === 0 ? 'COMPLETED_MATCH' : 'DISCREPANT';
+        }
+
         const { error: dbErr } = await supabase
           .from('Read_Mission_Tasks')
-          .update({
-            CountedQuantity: payload.counted_quantity,
-            SalesDuringAudit: payload.sales_during_audit,
-            UpdatedAt: new Date().toISOString(),
-          })
+          .update(updateData)
           .eq('TaskId', payload.task_id);
 
         if (!dbErr) {

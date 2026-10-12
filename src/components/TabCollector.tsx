@@ -22,7 +22,9 @@ import {
   CameraOff,
   Scan,
   Sparkles,
-  RefreshCw
+  RefreshCw,
+  Edit2,
+  Check
 } from 'lucide-react';
 import { Html5Qrcode } from 'html5-qrcode';
 import { useMissionStore } from '../store/useMissionStore';
@@ -75,6 +77,9 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
     targetQty: null,
     targetDeposit: null
   });
+  const [manualSystemQty, setManualSystemQty] = useState<number | null>(null);
+  const [isEditingSystemQty, setIsEditingSystemQty] = useState<boolean>(false);
+  const [tempSystemQtyInput, setTempSystemQtyInput] = useState<string>('');
 
   // Estados de escáner de cámara
   const [isCameraActive, setIsCameraActive] = useState<boolean>(false);
@@ -225,6 +230,8 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
           }
           lastScanTimeRef.current = now;
           lastScannedCodeRef.current = decodedText;
+          // Automáticamente ocultar y minimizar la cámara al leer un código
+          stopCameraScanner();
           processDetectedCode(decodedText, 'camera');
         },
         (_error) => {}
@@ -302,6 +309,9 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
           
       setCountedInput(existingCount);
       setSalesInput(existingSales);
+      setManualSystemQty(null);
+      setIsEditingSystemQty(false);
+      setTempSystemQtyInput('');
 
       setTimeout(() => {
         countInputRef.current?.focus();
@@ -310,6 +320,9 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
     } else {
       setCountedInput('');
       setSalesInput('0');
+      setManualSystemQty(null);
+      setIsEditingSystemQty(false);
+      setTempSystemQtyInput('');
       // Reset de datos en vivo al limpiar la tarea
       setLiveData({ systemQty: null, targetQty: null, targetDeposit: null });
     }
@@ -326,9 +339,9 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
     setCountedInput(String(nextVal));
   };
 
-  // --- CÁLCULO TEÓRICO (Prioridad al dato del ERP en vivo) ---
+  // --- CÁLCULO TEÓRICO (Prioridad al dato del ERP en vivo o ajuste manual) ---
   const baseSystemQty = Number(activeTask?.SystemQuantity ?? activeTask?.systemQuantity ?? 0);
-  const finalSystemQty = liveData.systemQty !== null ? liveData.systemQty : baseSystemQty;
+  const finalSystemQty = manualSystemQty !== null ? manualSystemQty : (liveData.systemQty !== null ? liveData.systemQty : baseSystemQty);
   const salesQty = parseFloat(salesInput) || 0;
   const adjustedTheoretical = finalSystemQty - salesQty;
   const countedQty = parseFloat(countedInput);
@@ -336,7 +349,7 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
   const liveDiscrepancy = isCountValid ? countedQty - adjustedTheoretical : 0;
   const isExactMatch = isCountValid && liveDiscrepancy === 0;
 
-  // NUEVO FLUJO CQRS: Registro Puro sin Mutar la Base de Datos Directamente
+  // NUEVO FLUJO CQRS: Registro y Actualización Dinámica de Stock en Supabase
   const handleRegisterCount = async () => {
     if (!activeTask) return;
     
@@ -366,7 +379,8 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
     const targetSysQty = liveData.targetQty || 0;
 
     // 1. Actualización optimista local en memoria (Feedback Instantáneo al Operador)
-    updateTaskCountLocally(skuCodeToUse, countedQty, salesQty, discrepancy, taskStatus);
+    // El stock del sistema se actualiza con la cantidad traída de la API (o manual)
+    updateTaskCountLocally(skuCodeToUse, countedQty, salesQty, discrepancy, taskStatus, finalSystemQty);
 
     // 2. Si se detecta discrepancia, registrar en cola local de destino (Agnóstico)
     if (discrepancy !== 0) {
@@ -394,28 +408,41 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
       deposit_code: originDeposit,
       sku_code: skuCodeToUse,
       counted_quantity: countedQty,
-      system_quantity: finalSystemQty, // ¡Este es el real en vivo!
+      system_quantity: finalSystemQty, // ¡Este es el real en vivo que actualiza la base de datos!
       sales_during_audit: salesQty,
       user_id: user.id,
       target_deposit: targetDeposit,
       target_system_quantity: targetSysQty
     };
 
-    // 4. Estrategia de Envío asíncrono
+    // 4. Estrategia de Envío asíncrono y Actualización en Supabase
     try {
       if (isOnline && isSupabaseConfigured) {
-        const { error } = await supabase.functions.invoke('register-count', {
+        // Actualizamos explícitamente en la base de datos de Supabase la nueva cantidad de sistema
+        // para que sustituya la cantidad anterior en Read_Mission_Tasks
+        const { error: dbUpdateErr } = await supabase
+          .from('Read_Mission_Tasks')
+          .update({
+            SystemQuantity: finalSystemQty,
+            CountedQuantity: countedQty,
+            SalesDuringAudit: salesQty,
+            Discrepancy: discrepancy,
+            Status: taskStatus,
+            UpdatedAt: new Date().toISOString()
+          })
+          .eq('TaskId', taskIdToUse);
+
+        if (dbUpdateErr) {
+          console.warn('[TabCollector] Error actualizando Read_Mission_Tasks en Supabase:', dbUpdateErr);
+        }
+
+        // Además invocamos la Edge Function de Supabase
+        const { error: fnErr } = await supabase.functions.invoke('register-count', {
           body: payload,
         });
 
-        if (error) {
-          console.warn('[TabCollector] Edge Function falló, encolando offline:', error);
-          await enqueueOfflineEvent({
-            type: 'register-count',
-            missionId: missionIdToUse,
-            taskId: taskIdToUse,
-            payload,
-          });
+        if (fnErr) {
+          console.warn('[TabCollector] Edge Function retornó advertencia:', fnErr);
         }
       } else {
         await enqueueOfflineEvent({
@@ -450,6 +477,9 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
       setCountedInput('');
       setSalesInput('0');
       setSearchTerm('');
+      setManualSystemQty(null);
+      setIsEditingSystemQty(false);
+      setTempSystemQtyInput('');
       setTimeout(() => {
         scannerInputRef.current?.focus();
       }, 50);
@@ -731,15 +761,92 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
 
           {/* Grid de Ecuación Teórica de Inventario (S, V, S - V) */}
           <div className="grid grid-cols-3 gap-2.5 sm:gap-3 bg-[#F8F9FA] p-3 sm:p-4 rounded-[8px] border border-[#E5E7EB] text-center">
-            <div className="p-2 bg-white rounded-[8px] border border-[#E5E7EB]">
-              <span className="text-[10px] sm:text-xs text-[#6B7280] uppercase font-black block tracking-wider flex items-center justify-center gap-1">
-                Sistema (S) {isLiveFetching && <RefreshCw className="w-3 h-3 animate-spin text-[#263988]" />}
-              </span>
-              <span className={`text-xl sm:text-2xl font-black font-mono mt-1 block transition-colors ${isLiveFetching ? 'text-[#6B7280]' : 'text-[#1F2937]'}`}>
-                {finalSystemQty.toFixed(2)}
-              </span>
-              <span className="text-[10px] text-[#263988] font-bold">{isLiveFetching ? 'Consultando API...' : liveData.systemQty !== null ? 'Dato en vivo ERP' : 'Dato almacenado'}</span>
-            </div>
+            {isEditingSystemQty ? (
+              <div className="p-2 bg-white rounded-[8px] border border-[#263988] shadow-xs relative">
+                <span className="text-[10px] sm:text-xs text-[#263988] uppercase font-black block tracking-wider flex items-center justify-center gap-1">
+                  Ajustar Sistema (S)
+                </span>
+                <div className="mt-1 flex items-center justify-center gap-1">
+                  <input
+                    type="number"
+                    step="any"
+                    min="0"
+                    value={tempSystemQtyInput}
+                    onChange={(e) => setTempSystemQtyInput(e.target.value)}
+                    className="w-18 px-1 py-0.5 text-center text-sm font-black font-mono border border-[#263988] rounded-[6px] focus:outline-hidden focus:ring-1 focus:ring-[#263988]"
+                    autoFocus
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        const parsed = parseFloat(tempSystemQtyInput);
+                        if (!isNaN(parsed) && parsed >= 0) {
+                          setManualSystemQty(parsed);
+                          setIsEditingSystemQty(false);
+                        }
+                      } else if (e.key === 'Escape') {
+                        setIsEditingSystemQty(false);
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const parsed = parseFloat(tempSystemQtyInput);
+                      if (!isNaN(parsed) && parsed >= 0) {
+                        setManualSystemQty(parsed);
+                        setIsEditingSystemQty(false);
+                      }
+                    }}
+                    className="p-1 bg-[#009045] text-white rounded-[6px] hover:bg-[#007a3a]"
+                    title="Confirmar ajuste de sistema"
+                  >
+                    <Check className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsEditingSystemQty(false)}
+                    className="p-1 bg-[#E5E7EB] text-[#1F2937] rounded-[6px] hover:bg-gray-300"
+                    title="Cancelar"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+                <span className="text-[9px] text-[#6B7280] block mt-0.5">Enter para guardar</span>
+              </div>
+            ) : (
+              <div className="p-2 bg-white rounded-[8px] border border-[#E5E7EB] relative group">
+                <div className="flex items-center justify-center gap-1">
+                  <span className="text-[10px] sm:text-xs text-[#6B7280] uppercase font-black tracking-wider flex items-center gap-1">
+                    Sistema (S) {isLiveFetching && <RefreshCw className="w-3 h-3 animate-spin text-[#263988]" />}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTempSystemQtyInput(String(finalSystemQty));
+                      setIsEditingSystemQty(true);
+                    }}
+                    className="p-0.5 text-[#6B7280] hover:text-[#263988] rounded transition"
+                    title="Modificar cantidad existente en sistema"
+                  >
+                    <Edit2 className="w-3 h-3" />
+                  </button>
+                </div>
+                <span className={`text-xl sm:text-2xl font-black font-mono mt-1 block transition-colors ${isLiveFetching ? 'text-[#6B7280]' : 'text-[#1F2937]'}`}>
+                  {finalSystemQty.toFixed(2)}
+                </span>
+                <span className="text-[10px] font-bold block">
+                  {isLiveFetching ? (
+                    <span className="text-[#263988]">Consultando API...</span>
+                  ) : manualSystemQty !== null ? (
+                    <span className="text-[#263988] bg-blue-50 px-1 py-0.2 rounded-full border border-[#263988]/20">Modificado manual</span>
+                  ) : liveData.systemQty !== null ? (
+                    <span className="text-[#009045] bg-emerald-50 px-1 py-0.2 rounded-full border border-[#009045]/20">Dato en vivo ERP</span>
+                  ) : (
+                    <span className="text-[#6B7280]">Dato almacenado</span>
+                  )}
+                </span>
+              </div>
+            )}
 
             <div className="p-2 bg-white rounded-[8px] border border-[#E5E7EB]">
               <span className="text-[10px] sm:text-xs text-[#F59E0B] uppercase font-black block tracking-wider">

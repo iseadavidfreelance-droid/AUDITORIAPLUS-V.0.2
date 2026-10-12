@@ -40,7 +40,8 @@ export interface MissionState {
     countedQty: number,
     salesQty: number,
     explicitDiscrepancy?: number,
-    explicitStatus?: TaskStatus
+    explicitStatus?: TaskStatus,
+    updatedSystemQty?: number
   ) => void;
 
   // Acciones complementarias de control
@@ -390,7 +391,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     countedQty: number,
     salesQty: number,
     explicitDiscrepancy?: number,
-    explicitStatus?: TaskStatus
+    explicitStatus?: TaskStatus,
+    updatedSystemQty?: number
   ) => {
     const trimmed = skuCode.trim();
     const normalizedSku = normalizeSku(trimmed);
@@ -408,7 +410,10 @@ export const useMissionStore = create<MissionState>((set, get) => ({
 
         if (!matches) return task;
 
-        const systemQty = Number(task.SystemQuantity ?? task.systemQuantity ?? 0);
+        const systemQty =
+          updatedSystemQty !== undefined
+            ? updatedSystemQty
+            : Number(task.SystemQuantity ?? task.systemQuantity ?? 0);
         const adjustedTheoretical = systemQty - salesQty;
         const discrepancy =
           explicitDiscrepancy !== undefined
@@ -420,6 +425,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
 
         const updated: MissionTask = {
           ...task,
+          SystemQuantity: systemQty,
+          systemQuantity: systemQty,
           CountedQuantity: countedQty,
           countedQuantity: countedQty,
           SalesDuringAudit: salesQty,
@@ -443,6 +450,15 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       });
 
       const newMetrics = calculateMetricsFromTasks(updatedTasks, state.activeMissionId);
+
+      if (state.activeMissionId) {
+        cacheMissionData(state.activeMissionId, {
+          metrics: newMetrics,
+          tasks: updatedTasks,
+        }).catch((err) => {
+          console.warn('[useMissionStore] No se pudo cachear actualización en IndexedDB:', err);
+        });
+      }
 
       return {
         tasks: updatedTasks,
