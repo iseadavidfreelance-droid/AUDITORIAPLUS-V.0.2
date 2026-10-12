@@ -30,7 +30,7 @@ import {
 import { supabase, isSupabaseConfigured, supabaseAnonKey, supabaseUrl } from '../lib/supabase';
 import { useMissionStore } from '../store/useMissionStore';
 import { useDiscrepancyStore } from '../stores/useDiscrepancyStore';
-import { VirtualTransfer, MissionTask } from '../types/audit';
+import { VirtualTransfer, MissionTask, DEPOSIT_NAMES, DepositCode } from '../types/audit';
 import { exportTasksToExcel, ExcelExportMode } from '../lib/exportExcel';
 
 type DifferenceFilter = 'ALL' | 'MISSING' | 'SURPLUS' | 'EXACT';
@@ -50,6 +50,10 @@ export const TabReports: React.FC = () => {
   const [differenceFilter, setDifferenceFilter] = useState<DifferenceFilter>('ALL');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL');
   const [taskSearchQuery, setTaskSearchQuery] = useState<string>('');
+
+  // Estados de filtrado reactivo para Traslados Virtuales Registrados
+  const [transferSearchQuery, setTransferSearchQuery] = useState<string>('');
+  const [transferDepositFilter, setTransferDepositFilter] = useState<string>('ALL');
 
   // 1. Cargar traslados virtuales de la misión activa
   const fetchTransfers = useCallback(async () => {
@@ -314,7 +318,6 @@ export const TabReports: React.FC = () => {
               <th>Descripción</th>
               <th>Costo</th>
               <th>Sistema</th>
-              <th>Ventas</th>
               <th>Contado</th>
               <th>Diferencia</th>
               <th>Estado</th>
@@ -333,7 +336,6 @@ export const TabReports: React.FC = () => {
                 <td>${t.SkuDescription}</td>
                 <td>$${Number(t.Cost || 0).toFixed(2)}</td>
                 <td>${Number(t.SystemQuantity || 0).toFixed(2)}</td>
-                <td>${Number(t.SalesDuringAudit || 0).toFixed(2)}</td>
                 <td>${t.CountedQuantity !== null && t.CountedQuantity !== undefined ? Number(t.CountedQuantity).toFixed(2) : '-'}</td>
                 <td style="font-weight:bold; color: ${disc === 0 ? '#009045' : disc < 0 ? '#DC2626' : '#F59E0B'}">
                   ${disc === 0 ? '0.00' : disc > 0 ? `+${disc.toFixed(2)}` : disc.toFixed(2)}
@@ -366,9 +368,46 @@ export const TabReports: React.FC = () => {
   };
 
   // AISLAMIENTO: Filtramos los traslados para solo mostrar los confirmados.
-  const executedTransfers = virtualTransfers.filter(
-    (vt) => vt.Status === 'COMPLETED' || (vt as any).status === 'COMPLETED'
-  );
+  const executedTransfers = useMemo(() => {
+    return virtualTransfers.filter(
+      (vt) => vt.Status === 'COMPLETED' || (vt as any).status === 'COMPLETED'
+    );
+  }, [virtualTransfers]);
+
+  // Filtros reactivos para la lista de Traslados Virtuales Registrados
+  const filteredTransfers = useMemo(() => {
+    return executedTransfers.filter((vt) => {
+      // 1. Filtro por SKU o Descripción
+      if (transferSearchQuery.trim()) {
+        const q = transferSearchQuery.toLowerCase().trim();
+        const sku = (vt.SkuCode || (vt as any).skuCode || '').toLowerCase();
+        const desc = (vt.SkuDescription || (vt as any).skuDescription || '').toLowerCase();
+        if (!sku.includes(q) && !desc.includes(q)) return false;
+      }
+
+      // 2. Filtro por Depósito (Origen o Destino)
+      if (transferDepositFilter !== 'ALL') {
+        const origin = String(vt.FromDeposit || (vt as any).fromDeposit || (vt as any).OriginDeposit || (vt as any).originDeposit || '');
+        const target = String(vt.ToDeposit || (vt as any).toDeposit || (vt as any).DestinationDeposit || (vt as any).destinationDeposit || '');
+        if (transferDepositFilter.startsWith('FROM_')) {
+          const code = transferDepositFilter.replace('FROM_', '');
+          if (origin !== code) return false;
+        } else if (transferDepositFilter.startsWith('TO_')) {
+          const code = transferDepositFilter.replace('TO_', '');
+          if (target !== code) return false;
+        }
+      }
+
+      return true;
+    });
+  }, [executedTransfers, transferSearchQuery, transferDepositFilter]);
+
+  const hasActiveTransferFilters = transferSearchQuery.trim() !== '' || transferDepositFilter !== 'ALL';
+
+  const clearTransferFilters = () => {
+    setTransferSearchQuery('');
+    setTransferDepositFilter('ALL');
+  };
 
   return (
     <div className="space-y-5 max-w-5xl mx-auto w-full">
@@ -510,20 +549,86 @@ export const TabReports: React.FC = () => {
         </div>
       </div>
 
-      {/* 3. TABLA DE TRASLADOS VIRTUALES (150104) */}
+      {/* 3. TABLA DE TRASLADOS VIRTUALES (150104) CON FILTROS Y SCROLLABLE COMPACTO */}
       <div className="bg-white border border-[#E5E7EB] rounded-[12px] p-4 sm:p-5 card-elevation space-y-4">
-        <div className="flex items-center justify-between">
+        {/* Cabecera con Título, Contador y Filtros Activos */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="flex items-center gap-2">
             <ShieldCheck className="w-5 h-5 text-[#009045]" />
-            <h3 className="text-sm sm:text-base font-black text-[#1F2937] uppercase tracking-wider">
-              Traslados Virtuales Registrados ({executedTransfers.length})
-            </h3>
+            <div>
+              <h3 className="text-sm sm:text-base font-black text-[#1F2937] uppercase tracking-wider">
+                Traslados Virtuales Registrados
+              </h3>
+              <p className="text-xs text-[#6B7280]">
+                Mostrando <strong className="text-[#1F2937]">{filteredTransfers.length}</strong> de <strong className="text-[#1F2937]">{executedTransfers.length}</strong> traslados confirmados
+                {hasActiveTransferFilters && (
+                  <span className="text-[#009045] font-semibold ml-1.5">(Filtros activos)</span>
+                )}
+              </p>
+            </div>
           </div>
-          <span className="text-xs text-[#6B7280] font-mono">
+          <span className="text-xs text-[#6B7280] font-mono bg-[#F8F9FA] px-2.5 py-1 rounded-full border border-[#E5E7EB] self-start sm:self-auto">
             Nodo Intermediario (150104)
           </span>
         </div>
 
+        {/* BARRA DE HERRAMIENTAS DE FILTROS PARA TRASLADOS */}
+        {executedTransfers.length > 0 && (
+          <div className="p-3 bg-[#F8F9FA] rounded-[8px] border border-[#E5E7EB]">
+            <div className="flex flex-col sm:flex-row gap-2.5 items-stretch sm:items-center justify-between">
+              <div className="flex flex-wrap sm:flex-nowrap items-center gap-2 w-full">
+                {/* Selector de Depósito (Origen / Destino) */}
+                <div className="w-full sm:w-56">
+                  <select
+                    value={transferDepositFilter}
+                    onChange={(e) => setTransferDepositFilter(e.target.value)}
+                    className="w-full h-9 px-2.5 bg-white border border-[#E5E7EB] rounded-[8px] text-[#1F2937] text-xs font-semibold focus:border-[#009045] focus:outline-hidden"
+                  >
+                    <option value="ALL">Todos los Depósitos</option>
+                    <option value="FROM_150101">Origen: Almacén Principal (150101)</option>
+                    <option value="FROM_150103">Origen: Piso de Venta (150103)</option>
+                    <option value="TO_150103">Destino: Piso de Venta (150103)</option>
+                    <option value="TO_150101">Destino: Almacén Principal (150101)</option>
+                    <option value="TO_150104">Tránsito Virtual (150104)</option>
+                  </select>
+                </div>
+
+                {/* Búsqueda por SKU o Descripción */}
+                <div className="relative flex-1 min-w-[200px]">
+                  <Search className="w-3.5 h-3.5 text-[#6B7280] absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="text"
+                    value={transferSearchQuery}
+                    onChange={(e) => setTransferSearchQuery(e.target.value)}
+                    placeholder="Buscar SKU o descripción..."
+                    className="w-full h-9 pl-8 pr-7 bg-white border border-[#E5E7EB] rounded-[8px] text-[#1F2937] text-xs focus:border-[#009045] focus:outline-hidden"
+                  />
+                  {transferSearchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setTransferSearchQuery('')}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-[#6B7280] hover:text-[#1F2937]"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                {hasActiveTransferFilters && (
+                  <button
+                    type="button"
+                    onClick={clearTransferFilters}
+                    className="text-xs text-[#DC2626] hover:underline font-bold px-1 whitespace-nowrap"
+                  >
+                    Restablecer
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* TABLA DESLIZABLE COMPACTA CON CABECERA FIJA */}
         {executedTransfers.length === 0 ? (
           <div className="bg-[#F8F9FA] border border-dashed border-[#E5E7EB] rounded-[8px] p-6 text-center text-[#6B7280]">
             <p className="text-sm font-semibold text-[#1F2937]">
@@ -533,11 +638,28 @@ export const TabReports: React.FC = () => {
               Los traslados se muestran aquí una vez son confirmados manualmente.
             </p>
           </div>
+        ) : filteredTransfers.length === 0 ? (
+          <div className="bg-[#F8F9FA] border border-dashed border-[#E5E7EB] rounded-[8px] p-6 text-center text-[#6B7280]">
+            <p className="text-sm font-semibold text-[#1F2937]">
+              No hay traslados que coincidan con los filtros de búsqueda
+            </p>
+            <p className="text-xs text-[#6B7280] mt-1">
+              Pruebe cambiando el depósito o el término de búsqueda, o{' '}
+              <button
+                type="button"
+                onClick={clearTransferFilters}
+                className="text-[#263988] font-bold underline"
+              >
+                restablezca los filtros
+              </button>
+              .
+            </p>
+          </div>
         ) : (
-          <div className="overflow-x-auto custom-scrollbar border border-[#E5E7EB] rounded-[8px]">
+          <div className="max-h-80 overflow-y-auto custom-scrollbar border border-[#E5E7EB] rounded-[8px]">
             <table className="w-full text-left border-collapse text-xs sm:text-sm">
-              <thead className="bg-[#F8F9FA]">
-                <tr className="border-b border-[#E5E7EB] text-[#6B7280] text-[11px] uppercase font-bold tracking-wider">
+              <thead className="bg-[#F8F9FA] sticky top-0 border-b border-[#E5E7EB] z-10 shadow-xs">
+                <tr className="text-[#6B7280] text-[11px] uppercase font-bold tracking-wider">
                   <th className="py-2.5 px-3">SKU</th>
                   <th className="py-2.5 px-3">Descripción</th>
                   <th className="py-2.5 px-3 text-center">Flujo de Depósitos</th>
@@ -546,29 +668,36 @@ export const TabReports: React.FC = () => {
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#E5E7EB] font-mono bg-white">
-                {executedTransfers.map((vt) => (
-                  <tr key={vt.TransferId || (vt as any).transferId} className="hover:bg-[#F8F9FA] transition">
-                    <td className="py-3 px-3 font-bold text-[#263988]">
-                      {vt.SkuCode || (vt as any).skuCode}
-                    </td>
-                    <td className="py-3 px-3 font-sans text-[#1F2937] max-w-xs truncate">
-                      {vt.SkuDescription || (vt as any).skuDescription || 'Artículo auditado'}
-                    </td>
-                    <td className="py-3 px-3 text-center">
-                      <span className="inline-flex items-center gap-1.5 text-xs text-[#1F2937] bg-[#F8F9FA] px-2.5 py-1 rounded-full border border-[#E5E7EB]">
-                        <span>Piso (150103)</span>
-                        <ArrowRight className="w-3 h-3 text-[#009045]" />
-                        <strong className="text-[#009045]">Tránsito (150104)</strong>
-                      </span>
-                    </td>
-                    <td className="py-3 px-3 text-right font-black text-[#009045]">
-                      +{Number((vt as any).TransferredQuantity || (vt as any).TransferQuantity || 0).toFixed(2)} u
-                    </td>
-                    <td className="py-3 px-3 text-right text-[#6B7280] text-xs">
-                      {new Date(vt.CreatedAt || Date.now()).toLocaleTimeString()}
-                    </td>
-                  </tr>
-                ))}
+                {filteredTransfers.map((vt) => {
+                  const fromCode = vt.FromDeposit || (vt as any).fromDeposit || (vt as any).OriginDeposit || '150103';
+                  const toCode = vt.ToDeposit || (vt as any).toDeposit || (vt as any).DestinationDeposit || '150104';
+                  const fromName = DEPOSIT_NAMES[fromCode as DepositCode] || `Dep. ${fromCode}`;
+                  const toName = DEPOSIT_NAMES[toCode as DepositCode] || `Dep. ${toCode}`;
+
+                  return (
+                    <tr key={vt.TransferId || (vt as any).transferId} className="hover:bg-[#F8F9FA] transition">
+                      <td className="py-2.5 px-3 font-bold text-[#263988]">
+                        {vt.SkuCode || (vt as any).skuCode}
+                      </td>
+                      <td className="py-2.5 px-3 font-sans text-[#1F2937] max-w-xs truncate">
+                        {vt.SkuDescription || (vt as any).skuDescription || 'Artículo auditado'}
+                      </td>
+                      <td className="py-2.5 px-3 text-center">
+                        <span className="inline-flex items-center gap-1.5 text-xs text-[#1F2937] bg-[#F8F9FA] px-2.5 py-1 rounded-full border border-[#E5E7EB]">
+                          <span>{fromName}</span>
+                          <ArrowRight className="w-3 h-3 text-[#009045]" />
+                          <strong className="text-[#009045]">{toName}</strong>
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3 text-right font-black text-[#009045]">
+                        +{Number((vt as any).TransferredQuantity || (vt as any).TransferQuantity || 0).toFixed(2)} u
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-[#6B7280] text-xs">
+                        {new Date(vt.CreatedAt || Date.now()).toLocaleTimeString()}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

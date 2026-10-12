@@ -61,7 +61,13 @@ export interface MissionTask {
   salesDuringAudit?: number;
   discrepancy?: number | null;
   status?: TaskStatus;
+  createdAt?: string;
+  updatedAt?: string;
   isFichaComplete?: boolean;
+  lastAuditorName?: string;
+  lastCountedAt?: string;
+  LastAuditorName?: string;
+  LastCountedAt?: string;
 }
 
 export interface FloorDiscrepancy {

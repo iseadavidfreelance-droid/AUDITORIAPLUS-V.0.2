@@ -363,10 +363,12 @@ export default function App() {
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => userRole === 'admin' && changeTab('ingestion')}
-                      className={`text-[11px] font-mono font-bold flex items-center gap-1 transition ${userRole === 'admin' ? 'text-white hover:text-emerald-200' : 'text-white/90 cursor-default'}`}
+                      className={`text-[11px] font-bold flex items-center gap-1 transition ${userRole === 'admin' ? 'text-white hover:text-emerald-200' : 'text-white/90 cursor-default'}`}
                     >
-                      <span>Misión: {activeMissionId.slice(0, 8)}</span>
-                      {userRole === 'admin' && <ChevronRight className="w-3 h-3 text-white/70" />}
+                      <span className="truncate max-w-[200px] sm:max-w-[320px]">
+                        Misión: {activeMission?.name || (activeMission as any)?.Name || activeMissionId.slice(0, 8)}
+                      </span>
+                      {userRole === 'admin' && <ChevronRight className="w-3 h-3 text-white/70 shrink-0" />}
                     </button>
 
                     {/* BOTÓN FASE 2: INICIAR ENRIQUECIMIENTO (SOLO ADMIN) */}
@@ -496,7 +498,7 @@ export default function App() {
             }`}
           >
             <Barcode className="w-5 h-5 mb-0.5" />
-            <span>Almacén</span>
+            <span>Conteo</span>
           </button>
 
           <button
@@ -515,7 +517,7 @@ export default function App() {
                 </span>
               )}
             </div>
-            <span>Piso (150103)</span>
+            <span>Discrepancias</span>
           </button>
 
           <button

@@ -1,78 +1,80 @@
-# Sincronización Dinámica de Stock Teórico en Supabase y Autocierre de Cámara
+# Control Anti-Doble Conteo, Corrección de Descripción en Piso y Eliminación de Ventas
 
-Plan de diseño y arquitectura técnica para actualizar automáticamente el stock del sistema en Supabase y en el Detalle de Tareas con el valor en vivo obtenido de la API al registrar el conteo, permitir su edición en caso de fallo de red, y minimizar automáticamente la cámara tras la captura de un código.
+Plan de arquitectura y desarrollo para implementar la detección y bloqueo visual de productos ya contados en origen mostrando auditor y fecha, corregir la sustitución errónea del nombre del producto por el código SKU en la vista de piso, eliminar por completo la sección de ventas durante la auditoría, y garantizar la compatibilidad estricta con el esquema de base de datos de Supabase en `/docs/estructura_supabase_actualizada.ts`.
 
 ## Decisiones Críticas y Confirmaciones del Usuario
 
 > [!IMPORTANT]
-> Decisiones confirmadas a través de la entrevista de alineación:
-> - **Cierre de cámara tras lectura**: Al detectar un código mediante el visor, la cámara se detiene y minimiza inmediatamente, manteniéndose cerrada hasta que el auditor pulse nuevamente el botón de cámara.
-> - **Actualización bidireccional del stock del sistema**: Si al escanear un SKU la API retorna una cantidad vigente en almacén (ej. 12 u frente a 20 u iniciales), al registrar el conteo el valor de 20 u se reemplaza permanentemente tanto en el estado local como en la base de datos de Supabase (`Read_Mission_Tasks.SystemQuantity`), recalculando la discrepancia real y reflejándose al instante en el Detalle de Tareas y reportes Excel.
-> - **Gestión de fallos de red / API**: En ausencia de conexión con el ERP o internet, se conserva el stock previo del sistema pero se habilita un control de edición asistido para que el auditor pueda corregir o ajustar manualmente la cantidad teórica de sistema si es necesario.
+> Decisiones confirmadas a través del proceso interactivo:
+> - **Tarjeta de advertencia fija para productos ya contados**: Al escanear o seleccionar un SKU que ya cuenta con un registro físico previo (`CountedQuantity !== null`), se presenta una **tarjeta fija en pantalla** (no un modal flotante) que informa que el producto ya fue auditado, indicando el **Nombre del Auditor**, la **Fecha y Hora del conteo**, la **Cantidad Contada ($Q_c$)**, la **Cantidad de Sistema ($S$)** y la **Diferencia**.
+> - **Bloqueo general con re-conteo explícito**: Por defecto, el botón de registrar conteo se deshabilita para evitar sobreescrituras accidentales. Sin embargo, se provee un botón de acción secundaria: *"Desbloquear y volver a contar este SKU"*, que solicita una confirmación expresa al operador antes de habilitar un nuevo registro.
+> - **Nombre real del producto en Piso / Destino**: Se resuelve el problema donde `SkuDescription` en `Read_Floor_Discrepancies` mostraba redundantemente el código del SKU. La vista cruzará los registros con `Read_Mission_Tasks` para desplegar el **nombre auténtico del artículo**, separando visualmente el código SKU de su descripción comercial.
+> - **Eliminación total del módulo de Ventas durante la auditoría**: Se erradica el input de ventas y sus columnas asociadas (`Ventas Hoy (V)` y `Teórico (S - V)`). La ecuación queda simplificada a $S$ vs $Q_c$ con diferencia directa ($Q_c - S$), enviando `SalesDuringAudit: 0` a Supabase para preservar la integridad del esquema sin requerir cambios de DDL.
+> - **Alineación con la base de datos oficial (`/docs`)**: Validación exhaustiva contra las tablas `Read_Mission_Tasks`, `Read_Floor_Discrepancies`, `Read_Virtual_Transfers` y `EventStore`.
 
 ---
 
 ### 1. Resumen y Concepto General
 
-- **Qué resuelve**: Elimina la inconsistencia de auditoría generada cuando el inventario base inicial (ej. 20 u) queda obsoleto frente a los movimientos de almacén reflejados por el ERP en tiempo real (ej. 12 u). Garantiza que tanto la conciliación operativa como la base de datos relacional de Supabase queden alineadas con la realidad física y digital al momento exacto de la auditoría.
-- **Experiencia de escaneo**: Automatiza el flujo ergonómico en dispositivos móviles: una vez que el auditor apunta y captura un código de barras o QR, la cámara se apaga y oculta instantáneamente para liberar espacio en pantalla y enfocar de inmediato el campo de cantidad contada, evitando lecturas continuas o sobrecalentamiento.
-- **Audiencia y Contexto**: Auditores de inventario y jefes de almacén en galpones y centros de distribución con o sin conectividad estable.
+- **Qué resuelve**: 
+  1. **Integridad de Conteo**: Evita el error crítico donde un operador o un segundo auditor vuelve a contar un producto ya registrado, perdiendo la trazabilidad de quién lo contó y cuándo.
+  2. **Claridad Visual en Piso**: Elimina la confusión donde los auditores de piso veían listas de números idénticos (SKU como descripción), devolviendo la visibilidad del nombre real del producto.
+  3. **Simplificación Operativa**: Suprime un campo de ventas innecesario que ralentizaba la captura física en galpón.
 
 ---
 
 ### 2. Experiencia de Usuario y Diseño Visual
 
-#### Flujo de Usuario Paso a Paso
+#### Flujo 1: Detección de SKU Ya Contado en Origen (`TabCollector.tsx`)
 
-1. **Lectura Inteligente con Cámara**:
-   - El auditor activa la cámara pulsando el botón de escaneo.
-   - Apunta al código del producto. En cuanto la cámara reconoce el código de barras/QR (vibración háptica de confirmación):
-     - El visor de la cámara se **detiene y minimiza inmediatamente** a su estado cerrado.
-     - La interfaz resalta la tarjeta de conteo y coloca el foco en el input de cantidad física contada.
-2. **Consulta en Tiempo Real e Indicador de Stock Actualizado**:
-   - En paralelo a la detección, el interceptor consulta la API de inventario en vivo (`/api/inventory?search={sku}`).
-   - Si la API responde con éxito (ej. stock actual: 12 u cuando antes había 20 u):
-     - La cantidad de sistema pasa de 20 u a 12 u con un badge verde de "Actualizado en ERP".
-     - Se ajusta la cantidad teórica base para el cálculo de discrepancia en tiempo real.
-3. **Modo Sin Conexión / Edición Asistida de Stock de Sistema**:
-   - Si la consulta al ERP falla o el dispositivo está desconectado:
-     - Se mantiene el stock de sistema previamente almacenado en base de datos.
-     - Aparece un control de ajuste rápido (botón de edición o input asistido de "Stock Sistema") que permite al auditor modificar la cantidad teórica en caso de contar con una nota de ajuste física o directiva de almacén.
-4. **Registro y Persistencia en Supabase**:
-   - El auditor introduce la cantidad contada y pulsa **REGISTRAR CONTEO AUDITORÍA**.
-   - El sistema:
-     - Actualiza `Read_Mission_Tasks` en Supabase con la nueva `SystemQuantity` (12 u), la `CountedQuantity` y el nuevo estado/discrepancia.
-     - Actualiza el almacén local IndexedDB y el Store global Zustand.
-     - Encola el payload con la nueva `system_quantity` en `offline_events_queue` si se trabaja sin internet para sincronización transparente.
-5. **Detalle de Tareas de Inventario y Exportaciones**:
-   - Al consultar la pestaña de Reportes y Detalle de Tareas, el registro del SKU ya no muestra 20 u; muestra las 12 u vigentes, con su discrepancia correcta frente a lo contado y con el cálculo exacto de costo.
-   - Las exportaciones a Excel estilizado reflejan fielmente las 12 u actualizadas en la columna "Sistema (S)".
+1. El auditor escanea o introduce un código de producto.
+2. Si la tarea está en estado pendiente (`CountedQuantity === null`):
+   - Flujo normal de captura: muestra stock de sistema, input de cantidad física y botón de registro.
+3. Si la tarea **ya fue contada previamente**:
+   - Se despliega una **Tarjeta Fija de Advertencia** con estilo corporativo (borde `#263988` y fondo `#F8F9FA`):
+     - Encabezado: `PRODUCTO YA AUDITADO EN ESTA MISIÓN` con icono de verificación y estado actual (`Coincidencia Exacta` o `Discrepancia`).
+     - Metadatos de auditoría:
+       - **Auditor**: Nombre del operador que ejecutó el conteo (ej. `David Isea` o `Auditor 150101`).
+       - **Fecha y Hora**: Estampa cronológica formateada (ej. `12/10/2026, 04:15 AM`).
+     - Resumen numérico:
+       - Contado: **$Q_c$ unidades**
+       - Sistema: **$S$ unidades**
+       - Discrepancia: **$\pm \Delta$ unidades**
+     - El botón estándar de registro queda bloqueado para prevenir duplicaciones.
+     - Botón de contingencia: `VOLVER A CONTAR ESTE SKU`. Al pulsarlo, emerge un diálogo nativo de confirmación: *"¿Deseas modificar el conteo previo realizado por [Auditor]? Esta acción registrará un nuevo ajuste."* Si se acepta, se habilita el campo de edición física.
 
-#### Tokens de Diseño Aplicados (Paleta Corporativa AUDITORIAPLUS+)
+#### Flujo 2: Identificación Clara del Producto en Destino (`TabFloorReconciliation.tsx`)
 
-- **Verde Esmeralda (`#009045`)**: Badge de stock verificado en vivo, botón primario de registro y badges de cuadratura exacta.
-- **Azul Marino Profundo (`#263988`)**: Controles de edición manual de stock de sistema, iconos de trazabilidad e indicadores principales.
-- **Ámbar / Discrepancia (`#F59E0B`)**: Alerta de discrepancia y estado de consulta sin conexión.
-- **Rojo Alerta (`#DC2626`)**: Indicador de faltantes.
-- **Bordes e Inputs**: `8px` de radio con elevación estándar de tarjetas (`box-shadow: 0 4px 12px rgba(38, 57, 136, 0.08)`).
+1. Al acceder a la pestaña de **Piso (150103)**:
+2. La lista de "Pendientes por Verificar" vincula reactivamente cada discrepancia con el catálogo de tareas (`Read_Mission_Tasks`):
+   - Muestra el **Código SKU** en un badge monospaciado: `SKU: 001245`.
+   - Muestra el **Nombre Real del Producto** en tipografía destacada: `Aceite Vegetal Diana 1L`.
+   - Se elimina por completo la sobreescritura donde el SKU reemplazaba al nombre.
+3. Al registrar la reconciliación o traslado, el sistema envía el `SkuDescription` auténtico hacia Supabase para sanear la tabla `Read_Floor_Discrepancies`.
+
+#### Flujo 3: Eliminación del Bloque de Ventas (`TabCollector.tsx`)
+
+1. Se retira el campo inferior *"VENTAS REGISTRADAS DURANTE LA AUDITORÍA"*.
+2. El grid de inventario se simplifica a 2 paneles limpios y de alto contraste:
+   - **Sistema ($S$)**: Stock teórico vigente (ERP o almacenado).
+   - **Contado Físico ($Q_c$)**: Entrada numérica industrial grande.
+3. La diferencia se calcula de inmediato como $Q_c - S$, con feedback háptico y banners reactivos en verde esmeralda (`#009045`) o ámbar (`#F59E0B`).
 
 ---
 
 ### 3. Decisiones de Producto y Arquitectura
 
-#### Decisión 1: Minimizador Reactivo de Cámara vs. Retardo Manual
-- **Enfoque adoptado**: Apagado y colapso atómico inmediato del componente `Html5Qrcode` en el callback `onScanSuccess`.
-- **Justificación**: En la práctica de almacén, mantener la cámara abierta tras capturar un producto consume batería, recalienta el dispositivo móvil y provoca lecturas accidentales de productos contiguos en la estantería.
-- **Alternativas descartadas**: Dejar la cámara en pausa con un botón de cerrar manual obligaba al auditor a hacer un tap innecesario en cada SKU.
+#### Decisión 1: Tarjeta Fija vs Modal Emergente para SKUs Ya Contados
+- **Enfoque adoptado**: Tarjeta integrada fija en el flujo del colector.
+- **Justificación**: En terminales industriales o smartphones de almacén, los modales emergentes bloquean la navegación con cierres accidentales. Una tarjeta fija mantiene visible toda la información del SKU y del auditor sin interrumpir el flujo táctil.
 
-#### Decisión 2: Actualización Persistente de `SystemQuantity` en Supabase
-- **Enfoque adoptado**: Al despachar la Edge Function `register-count` o al ejecutar el fallback directo en Supabase (`Read_Mission_Tasks`), se incluye explícitamente `SystemQuantity: payload.system_quantity`.
-- **Justificación**: Si un SKU tenía 20 u registradas en la ingesta inicial pero al momento de la auditoría el ERP certifica que hay 12 u, conservar 20 u falsearía los reportes contables, los traslados al depósito 150104 y las métricas de merma. La auditoría debe congelar la cantidad de sistema vigente al momento del escaneo.
-- **Alternativas descartadas**: Guardar el valor nuevo sólo en una variable temporal de memoria; esto provocaba que al recargar la página o emitir el Excel reaparecieran las 20 u originales desfasadas.
+#### Decisión 2: Trazabilidad del Auditor en `EventStore` y Memoria
+- **Enfoque adoptado**: Al registrar un conteo, guardar el usuario responsable tanto en el payload local de la tarea como en `EventStore` (`EventType: 'TaskCountRegistered'`) con metadata `{ auditor_name: user.email || user.username }`.
+- **Justificación**: Permite responder con exactitud quién y cuándo contó el producto al volver a escanearlo, sin alterar las columnas de `Read_Mission_Tasks`.
 
-#### Decisión 3: Modo Contingencia con Edición Manual de Stock de Sistema
-- **Enfoque adoptado**: Si no hay conexión o la API no responde, se mantiene la cantidad base previa, pero se desbloquea un interruptor de edición rápida con confirmación para sobreescribir el stock de sistema si el auditor lo necesita.
-- **Justificación**: Cumple estrictamente la directiva del usuario asegurando la continuidad operativa en zonas sin cobertura o fallos temporales de red local.
+#### Decisión 3: Resolución de Nombres de Producto en Tiempo de Ejecución
+- **Enfoque adoptado**: Función de normalización `getRealSkuDescription(skuCode)` que busca primero en `tasks` (`Read_Mission_Tasks`), donde el nombre del producto es auténtico, sustituyendo cualquier valor numérico o redundante proveniente de `Read_Floor_Discrepancies`.
+- **Justificación**: Corrige el bug visual de inmediato en la interfaz sin necesidad de migraciones destructivas en la base de datos de producción.
 
 ---
 
@@ -80,53 +82,51 @@ Plan de diseño y arquitectura técnica para actualizar automáticamente el stoc
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────┐
-│                             FLUJO DE CAPTURA Y PERSISTENCIA                      │
+│                             FLUJO DE VERIFICACIÓN Y AUDITORÍA                    │
 └──────────────────────────────────────────────────────────────────────────────────┘
 
-   [ Lector Cámara Trasera ]  ───> Detecta Código ───> 1. Inmediato: stopCameraScanner()
-                                                              │  (Cierra y oculta visor)
-                                                              ▼
-                                                    2. Consulta ERP (/api/inventory)
-                                                              │
-                     ┌────────────────────────────────────────┴────────────────────────────────────────┐
-                     ▼                                                                                 ▼
-          [ Conexión ERP Exitosa ]                                                        [ Sin Conexión ERP ]
-          - Obtiene Stock Vivo (ej. 12 u)                                                 - Mantiene Stock Previo (20 u)
-          - Activa Badge "ERP Actualizado"                                                - Habilita Edición Manual asistida
-                     │                                                                                 │
-                     └────────────────────────────────────────┬────────────────────────────────────────┘
-                                                              ▼
-                                              3. Auditor Ingresa Conteo Físico
-                                                              │
-                                                              ▼
-                                            4. handleRegisterCount()
-                                                              │
-                     ┌────────────────────────────────────────┴────────────────────────────────────────┐
-                     ▼                                                                                 ▼
-           [ Zustand Store & Cache ]                                                    [ Supabase & Offline Queue ]
-       - updateTaskCountLocally:                                                     - Supabase Edge Function / Direct DB:
-         * SystemQuantity = 12 u                                                       * SystemQuantity = 12 u
-         * CountedQuantity = Qc                                                        * CountedQuantity = Qc
-         * Discrepancy recalculada                                                     * Discrepancy & Status actualizados
-       - IndexedDB: cacheMissionData()                                               - Si offline: encola en offline_events_queue
-                     │                                                                                 │
-                     └────────────────────────────────────────┬────────────────────────────────────────┘
-                                                              ▼
-                                            5. Detalles de Tareas & Excel
-                                   - Muestra 12 u en columna "Sistema (S)"
-                                   - Discrepancia real auditada
-                                   - Reporte Excel (.xlsx) sincronizado
+   [ Escaneo de SKU en Origen ]
+                │
+                ▼
+       ¿task.CountedQuantity !== null?
+          │                     │
+         SÍ                     NO
+          │                     │
+          ▼                     ▼
+   [ Tarjeta de Advertencia Fija ]   [ Formulario Directo de Conteo ]
+   - "Ya contado por [Auditor]"       - Sistema (S) vs Físico (Qc)
+   - Fecha/Hora: [task.UpdatedAt]     - Botón "REGISTRAR CONTEO"
+   - Qc, S, Discrepancia
+   - Botón: [Volver a contar]
+          │ (Con confirmación)
+          ▼
+   [ Desbloqueo Asistido ]
+
+
+   [ Lista de Piso en Destino ]
+                │
+                ▼
+   Read_Floor_Discrepancies (Dato crudo)
+                │
+                ▼ (Cruce con Read_Mission_Tasks)
+   matchingTask?.SkuDescription !== SkuCode ? matchingTask.SkuDescription : d.SkuDescription
+                │
+                ▼
+   [ Renderizado Claro ]: Badge SKU (001245) + Nombre Real ("Arroz Primor 1kg")
 ```
 
-#### Mapeo de Entidades y Estado
+#### Validación de Coherencia con `/docs/estructura_supabase_actualizada.ts`
 
-1. **`useMissionStore.ts`**:
-   - Ampliación de `updateTaskCountLocally(skuCode, countedQty, salesQty, explicitDiscrepancy, explicitStatus, updatedSystemQty)` para actualizar `SystemQuantity` y `systemQuantity` tanto en la tarea como en `activeTask` y recalcular métricas generales.
-2. **`TabCollector.tsx`**:
-   - En `startCameraScanner`: invocar `stopCameraScanner()` al decodificar un código exitoso.
-   - En la tarjeta teórica: habilitar estado de `isEditingSystemQty` y control manual cuando no haya stock en vivo de API o se requiera ajuste.
-   - En `handleRegisterCount`: despachar `finalSystemQty` hacia Supabase (`Read_Mission_Tasks`), actualizando `SystemQuantity` directamente en la base de datos PostgreSQL y en la cola IndexedDB.
-3. **`sync.ts`**:
-   - Actualización del procesador de cola offline para que al sincronizar `register-count` actualice también la columna `SystemQuantity` en `Read_Mission_Tasks`.
-4. **`TabReports.tsx`**:
-   - La tabla "Detalles de Tareas de Inventario" y la exportación Excel consumen automáticamente las tareas con su `SystemQuantity` ya actualizado.
+1. **`Read_Mission_Tasks`**:
+   - `SystemQuantity`: Cantidad de sistema en vivo.
+   - `CountedQuantity`: Cantidad física contada.
+   - `SalesDuringAudit`: Fijado a `0` (compatible con el tipo `number` obligatorio).
+   - `Discrepancy`: $Q_c - S$.
+   - `Status`: `COMPLETED_MATCH` o `DISCREPANT`.
+   - `UpdatedAt`: Timestamp ISO para fecha de auditoría.
+2. **`Read_Floor_Discrepancies`**:
+   - `SkuCode`: Código numérico o alfanumérico del producto.
+   - `SkuDescription`: Nombre real del artículo verificado.
+   - `OriginDeposit`, `TargetDeposit`, `OriginDiscrepancy`, `TargetSystemQuantity`, `TargetCountedQuantity`, `TargetDiscrepancy`, `Status`.
+3. **`EventStore`**:
+   - Registro de auditoría `TaskCountRegistered` con `UserId`, `Timestamp` y `Payload` conteniendo el nombre del auditor para consulta histórica.

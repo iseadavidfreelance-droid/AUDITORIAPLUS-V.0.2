@@ -56,22 +56,39 @@ export const useDiscrepancyStore = create<DiscrepancyState>((set) => ({
         .eq('Status', 'PENDING_TARGET_COUNT'); // <-- El nuevo estado agnóstico
 
       if (!error && data) {
-        // Traductor: De Columnas Supabase a Variables React
-        const mappedData: FloorDiscrepancy[] = data.map(item => ({
-          discrepancyId: item.DiscrepancyId,
-          missionId: item.MissionId,
-          taskId: item.TaskId || '', 
-          skuCode: item.SkuCode,
-          skuDescription: item.SkuDescription,
-          originDeposit: item.OriginDeposit as any,
-          targetDeposit: item.TargetDeposit as any,
-          originDiscrepancy: item.OriginDiscrepancy, // <-- El nuevo nombre de columna
-          targetSystemQuantity: item.TargetSystemQuantity,
-          targetCountedQuantity: item.TargetCountedQuantity,
-          targetDiscrepancy: item.TargetDiscrepancy,
-          status: item.Status as any,
-          resolvedAt: null
-        }));
+        // Traductor: De Columnas Supabase a Variables React asegurando nombre real de producto
+        const missionState = (await import('../store/useMissionStore')).useMissionStore.getState();
+        let missionTasks = missionState.tasks || [];
+        if (missionTasks.length === 0 && missionId) {
+          missionTasks = await missionState.fetchMissionTasks(missionId);
+        }
+
+        const mappedData: FloorDiscrepancy[] = data.map(item => {
+          const skuTrimmed = (item.SkuCode || '').trim();
+          const task = missionTasks.find(t => (t.SkuCode || t.skuCode || '').trim() === skuTrimmed);
+          const isItemDescReal = item.SkuDescription && item.SkuDescription.trim() !== skuTrimmed && !/^\d{1,8}$/.test(item.SkuDescription.trim());
+          const realName =
+            task?.SkuDescription ||
+            task?.skuDescription ||
+            (isItemDescReal ? item.SkuDescription : '') ||
+            'Artículo auditado';
+
+          return {
+            discrepancyId: item.DiscrepancyId,
+            missionId: item.MissionId,
+            taskId: item.TaskId || task?.TaskId || '', 
+            skuCode: item.SkuCode,
+            skuDescription: realName,
+            originDeposit: item.OriginDeposit as any,
+            targetDeposit: item.TargetDeposit as any,
+            originDiscrepancy: item.OriginDiscrepancy,
+            targetSystemQuantity: item.TargetSystemQuantity,
+            targetCountedQuantity: item.TargetCountedQuantity,
+            targetDiscrepancy: item.TargetDiscrepancy,
+            status: item.Status as any,
+            resolvedAt: null
+          };
+        });
         set({ pendingFloorDiscrepancies: mappedData });
       } else if (error) {
         console.error("Error leyendo discrepancias de BD:", error.message);

@@ -41,7 +41,8 @@ export interface MissionState {
     salesQty: number,
     explicitDiscrepancy?: number,
     explicitStatus?: TaskStatus,
-    updatedSystemQty?: number
+    updatedSystemQty?: number,
+    auditorName?: string
   ) => void;
 
   // Acciones complementarias de control
@@ -349,6 +350,27 @@ export const useMissionStore = create<MissionState>((set, get) => ({
 
       const newMetrics = calculateMetricsFromTasks(loadedTasks, missionId);
 
+      let missionName = get().activeMission?.name || (get().activeMission as any)?.Name;
+      if (!missionName || missionName.startsWith('Misión ')) {
+        if (get().isOnline && isSupabaseConfigured) {
+          try {
+            const { data: missionData } = await supabase
+              .from('Read_Missions')
+              .select('Name')
+              .eq('MissionId', missionId)
+              .maybeSingle();
+            if (missionData?.Name) {
+              missionName = missionData.Name;
+            }
+          } catch {
+            // Silently fallback
+          }
+        }
+      }
+      if (!missionName) {
+        missionName = `Misión ${missionId.slice(0, 8)}`;
+      }
+
       set({
         tasks: loadedTasks,
         metrics: newMetrics,
@@ -356,7 +378,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         activeMission: {
           ...newMetrics,
           missionId,
-          name: `Misión ${missionId.slice(0, 8)}`,
+          name: missionName,
         },
       });
 
@@ -366,6 +388,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
       const cached = await getCachedMissionData(missionId).catch(() => null);
       if (cached && cached.tasks) {
         const fallbackMetrics = calculateMetricsFromTasks(cached.tasks, missionId);
+        const currentName = get().activeMission?.name || (get().activeMission as any)?.Name || `Misión ${missionId.slice(0, 8)}`;
         set({
           tasks: cached.tasks,
           metrics: fallbackMetrics,
@@ -373,6 +396,7 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           activeMission: {
             ...fallbackMetrics,
             missionId,
+            name: currentName,
           },
         });
         return cached.tasks;
@@ -392,13 +416,15 @@ export const useMissionStore = create<MissionState>((set, get) => ({
     salesQty: number,
     explicitDiscrepancy?: number,
     explicitStatus?: TaskStatus,
-    updatedSystemQty?: number
+    updatedSystemQty?: number,
+    auditorName?: string
   ) => {
     const trimmed = skuCode.trim();
     const normalizedSku = normalizeSku(trimmed);
 
     set((state) => {
       let updatedActiveTask = state.activeTask;
+      const nowIso = new Date().toISOString();
 
       const updatedTasks = state.tasks.map((task) => {
         const code = (task.SkuCode || task.skuCode || '').trim();
@@ -423,6 +449,8 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         const status: TaskStatus =
           explicitStatus || (discrepancy === 0 ? 'COMPLETED_MATCH' : 'DISCREPANT');
 
+        const resolvedAuditor = auditorName || task.lastAuditorName || task.LastAuditorName;
+
         const updated: MissionTask = {
           ...task,
           SystemQuantity: systemQty,
@@ -435,7 +463,12 @@ export const useMissionStore = create<MissionState>((set, get) => ({
           discrepancy: discrepancy,
           Status: status,
           status: status,
-          UpdatedAt: new Date().toISOString(),
+          UpdatedAt: nowIso,
+          updatedAt: nowIso,
+          lastAuditorName: resolvedAuditor,
+          LastAuditorName: resolvedAuditor,
+          lastCountedAt: nowIso,
+          LastCountedAt: nowIso,
         };
 
         if (

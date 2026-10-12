@@ -1,6 +1,6 @@
 {
-  "summary":  "Plan de implementación para la actualización dinámica del stock de sistema en Supabase al auditar, minimización automática del visor de cámara tras escaneo y edición asistida de existencias en contingencia offline.",
-  "updatedAt":  "2026-10-11T23:28:44.762002946Z",
+  "summary":  "Plan de implementación para protección contra doble conteo con tarjeta fija informativa de auditor previo y re-conteo asistido, corrección del nombre real de producto en discrepancias de piso (destino), eliminación del flujo de ventas durante auditoría, y validación estricta del esquema Supabase en /docs.",
+  "updatedAt":  "2026-10-12T11:23:51.629010882Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

@@ -24,7 +24,12 @@ import {
   Sparkles,
   RefreshCw,
   Edit2,
-  Check
+  Check,
+  Clock,
+  Lock,
+  Unlock,
+  User,
+  ShieldAlert
 } from 'lucide-react';
 import { Html5Qrcode } from 'html5-qrcode';
 import { useMissionStore } from '../store/useMissionStore';
@@ -34,6 +39,13 @@ import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { enqueueOfflineEvent } from '../lib/db';
 import { normalizeSku, FloorDiscrepancy } from '../types/audit';
 import { useAuthStore } from '../stores/useAuthStore';
+import {
+  getAuditorName,
+  getTaskAuditRecord,
+  saveTaskAuditRecord,
+  formatAuditDate,
+  TaskAuditRecord
+} from '../lib/auditLog';
 
 interface TabCollectorProps {
   onNavigateToFloor?: () => void;
@@ -62,8 +74,14 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
 
   // Estados locales de conteo
   const [countedInput, setCountedInput] = useState<string>('');
-  const [salesInput, setSalesInput] = useState<string>('0');
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  
+  // Estados de control de auditoría previa y bloqueo
+  const [auditLogInfo, setAuditLogInfo] = useState<TaskAuditRecord | null>(null);
+  const [isLoadingAuditLog, setIsLoadingAuditLog] = useState<boolean>(false);
+  const [isRecountAllowed, setIsRecountAllowed] = useState<boolean>(false);
+  const [showRecountModal, setShowRecountModal] = useState<boolean>(false);
+
   const [toast, setToast] = useState<{
     text: string;
     type: 'success' | 'warning' | 'error';
@@ -302,27 +320,51 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
         : activeTask.countedQuantity !== null && activeTask.countedQuantity !== undefined
         ? String(activeTask.countedQuantity)
         : '';
-          
-      const existingSales = activeTask.SalesDuringAudit !== undefined 
-        ? String(activeTask.SalesDuringAudit) 
-        : String(activeTask.salesDuringAudit || 0);
-          
+
+      const isCounted = activeTask.CountedQuantity !== null && activeTask.CountedQuantity !== undefined;
+
       setCountedInput(existingCount);
-      setSalesInput(existingSales);
       setManualSystemQty(null);
       setIsEditingSystemQty(false);
       setTempSystemQtyInput('');
+      setShowRecountModal(false);
 
-      setTimeout(() => {
-        countInputRef.current?.focus();
-        countInputRef.current?.select();
-      }, 50);
+      if (isCounted) {
+        setIsRecountAllowed(false);
+        setIsLoadingAuditLog(true);
+        const taskId = activeTask.TaskId || activeTask.taskId || '';
+        const sku = activeTask.SkuCode || activeTask.skuCode || '';
+        const timestamp = activeTask.UpdatedAt || activeTask.updatedAt || activeTask.CreatedAt || '';
+
+        getTaskAuditRecord(taskId, sku, timestamp)
+          .then((rec) => {
+            setAuditLogInfo(rec);
+          })
+          .catch(() => {
+            setAuditLogInfo({
+              auditorName: activeTask.lastAuditorName || activeTask.LastAuditorName || 'Auditor Asignado',
+              countedAt: timestamp || new Date().toISOString()
+            });
+          })
+          .finally(() => {
+            setIsLoadingAuditLog(false);
+          });
+      } else {
+        setIsRecountAllowed(true);
+        setAuditLogInfo(null);
+        setTimeout(() => {
+          countInputRef.current?.focus();
+          countInputRef.current?.select();
+        }, 50);
+      }
     } else {
       setCountedInput('');
-      setSalesInput('0');
       setManualSystemQty(null);
       setIsEditingSystemQty(false);
       setTempSystemQtyInput('');
+      setIsRecountAllowed(false);
+      setShowRecountModal(false);
+      setAuditLogInfo(null);
       // Reset de datos en vivo al limpiar la tarea
       setLiveData({ systemQty: null, targetQty: null, targetDeposit: null });
     }
@@ -342,12 +384,13 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
   // --- CÁLCULO TEÓRICO (Prioridad al dato del ERP en vivo o ajuste manual) ---
   const baseSystemQty = Number(activeTask?.SystemQuantity ?? activeTask?.systemQuantity ?? 0);
   const finalSystemQty = manualSystemQty !== null ? manualSystemQty : (liveData.systemQty !== null ? liveData.systemQty : baseSystemQty);
-  const salesQty = parseFloat(salesInput) || 0;
-  const adjustedTheoretical = finalSystemQty - salesQty;
+  const salesQty = 0; // Se elimina el sistema de ventas por requerimiento de negocio
+  const adjustedTheoretical = finalSystemQty;
   const countedQty = parseFloat(countedInput);
   const isCountValid = !isNaN(countedQty) && countedQty >= 0;
   const liveDiscrepancy = isCountValid ? countedQty - adjustedTheoretical : 0;
   const isExactMatch = isCountValid && liveDiscrepancy === 0;
+  const isAlreadyCounted = Boolean(activeTask && activeTask.CountedQuantity !== null && activeTask.CountedQuantity !== undefined);
 
   // NUEVO FLUJO CQRS: Registro y Actualización Dinámica de Stock en Supabase
   const handleRegisterCount = async () => {
@@ -378,26 +421,32 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
     const targetDeposit = liveData.targetDeposit || (originDeposit === '150101' ? '150103' : '150101');
     const targetSysQty = liveData.targetQty || 0;
 
+    const auditorName = getAuditorName(user);
+    const nowIso = new Date().toISOString();
+
+    // 0. Guardar auditor en la caché local para lectura instantánea futura
+    saveTaskAuditRecord(taskIdToUse, skuCodeToUse, auditorName, nowIso);
+
     // 1. Actualización optimista local en memoria (Feedback Instantáneo al Operador)
-    // El stock del sistema se actualiza con la cantidad traída de la API (o manual)
-    updateTaskCountLocally(skuCodeToUse, countedQty, salesQty, discrepancy, taskStatus, finalSystemQty);
+    updateTaskCountLocally(skuCodeToUse, countedQty, 0, discrepancy, taskStatus, finalSystemQty, auditorName);
 
     // 2. Si se detecta discrepancia, registrar en cola local de destino (Agnóstico)
+    const discItem: FloorDiscrepancy = {
+      discrepancyId: crypto.randomUUID ? crypto.randomUUID() : `disc_${Date.now()}`,
+      taskId: taskIdToUse as any,
+      missionId: missionIdToUse,
+      skuCode: skuCodeToUse,
+      skuDescription: skuDescToUse,
+      originDiscrepancy: discrepancy,
+      originDeposit: originDeposit as any,
+      targetDeposit: targetDeposit as any,
+      targetSystemQuantity: targetSysQty,
+      targetCountedQuantity: null,
+      targetDiscrepancy: null,
+      status: 'PENDING_TARGET_COUNT',
+    };
+
     if (discrepancy !== 0) {
-      const discItem: FloorDiscrepancy = {
-        discrepancyId: crypto.randomUUID ? crypto.randomUUID() : `disc_${Date.now()}`,
-        taskId: taskIdToUse as any,
-        missionId: missionIdToUse,
-        skuCode: skuCodeToUse,
-        skuDescription: skuDescToUse,
-        originDiscrepancy: discrepancy,
-        originDeposit: originDeposit as any,
-        targetDeposit: targetDeposit as any,
-        targetSystemQuantity: targetSysQty,
-        targetCountedQuantity: null,
-        targetDiscrepancy: null,
-        status: 'PENDING_TARGET_COUNT',
-      };
       addDiscrepancy(discItem as any);
     }
 
@@ -409,7 +458,7 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
       sku_code: skuCodeToUse,
       counted_quantity: countedQty,
       system_quantity: finalSystemQty, // ¡Este es el real en vivo que actualiza la base de datos!
-      sales_during_audit: salesQty,
+      sales_during_audit: 0,
       user_id: user.id,
       target_deposit: targetDeposit,
       target_system_quantity: targetSysQty
@@ -419,16 +468,15 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
     try {
       if (isOnline && isSupabaseConfigured) {
         // Actualizamos explícitamente en la base de datos de Supabase la nueva cantidad de sistema
-        // para que sustituya la cantidad anterior en Read_Mission_Tasks
         const { error: dbUpdateErr } = await supabase
           .from('Read_Mission_Tasks')
           .update({
             SystemQuantity: finalSystemQty,
             CountedQuantity: countedQty,
-            SalesDuringAudit: salesQty,
+            SalesDuringAudit: 0,
             Discrepancy: discrepancy,
             Status: taskStatus,
-            UpdatedAt: new Date().toISOString()
+            UpdatedAt: nowIso
           })
           .eq('TaskId', taskIdToUse);
 
@@ -436,7 +484,55 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
           console.warn('[TabCollector] Error actualizando Read_Mission_Tasks en Supabase:', dbUpdateErr);
         }
 
-        // Además invocamos la Edge Function de Supabase
+        // Insertar en EventStore cumpliendo arquitectura CQRS estricta (/docs/estructura_supabase_actualizada.ts)
+        const generateUUID = () => {
+          return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+            const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+          });
+        };
+
+        const { error: eventError } = await supabase.from('EventStore').insert({
+          EventId: generateUUID(),
+          EventType: 'PhysicalCountRegistered',
+          AggregateId: taskIdToUse,
+          AggregateType: 'MissionTask',
+          UserId: user.id,
+          CorrelationId: generateUUID(),
+          Payload: payload,
+          Metadata: {
+            auditor_name: auditorName,
+            sku_code: skuCodeToUse,
+            counted_quantity: countedQty,
+            system_quantity: finalSystemQty,
+            discrepancy
+          },
+          SequenceNum: 1,
+          Timestamp: nowIso,
+          Version: 1
+        });
+
+        if (eventError) {
+          console.warn('[TabCollector] Advertencia al registrar en EventStore:', eventError);
+        }
+
+        // Si se generó discrepancia, persistir en Read_Floor_Discrepancies con SkuDescription real
+        if (discrepancy !== 0) {
+          await supabase.from('Read_Floor_Discrepancies').upsert({
+            DiscrepancyId: discItem.discrepancyId,
+            MissionId: missionIdToUse,
+            OriginDeposit: originDeposit,
+            OriginDiscrepancy: discrepancy,
+            SkuCode: skuCodeToUse,
+            SkuDescription: skuDescToUse,
+            Status: 'PENDING_TARGET_COUNT',
+            TargetDeposit: targetDeposit,
+            TargetSystemQuantity: targetSysQty,
+            UpdatedAt: nowIso
+          });
+        }
+
+        // Invocamos la Edge Function de Supabase
         const { error: fnErr } = await supabase.functions.invoke('register-count', {
           body: payload,
         });
@@ -475,11 +571,13 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
 
       clearActiveTask();
       setCountedInput('');
-      setSalesInput('0');
       setSearchTerm('');
       setManualSystemQty(null);
       setIsEditingSystemQty(false);
       setTempSystemQtyInput('');
+      setIsRecountAllowed(false);
+      setShowRecountModal(false);
+      setAuditLogInfo(null);
       setTimeout(() => {
         scannerInputRef.current?.focus();
       }, 50);
@@ -759,254 +857,372 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
             </button>
           </div>
 
-          {/* Grid de Ecuación Teórica de Inventario (S, V, S - V) */}
-          <div className="grid grid-cols-3 gap-2.5 sm:gap-3 bg-[#F8F9FA] p-3 sm:p-4 rounded-[8px] border border-[#E5E7EB] text-center">
-            {isEditingSystemQty ? (
-              <div className="p-2 bg-white rounded-[8px] border border-[#263988] shadow-xs relative">
-                <span className="text-[10px] sm:text-xs text-[#263988] uppercase font-black block tracking-wider flex items-center justify-center gap-1">
-                  Ajustar Sistema (S)
-                </span>
-                <div className="mt-1 flex items-center justify-center gap-1">
+          {/* CASO 1: PRODUCTO YA CONTADO Y BLOQUEADO (TARJETA FIJA DE ADVERTENCIA) */}
+          {isAlreadyCounted && !isRecountAllowed ? (
+            <div className="bg-amber-50 border-2 border-[#F59E0B] rounded-[12px] p-4 sm:p-5 card-elevation space-y-4">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <div className="p-2.5 bg-amber-100 text-[#D97706] rounded-[8px] shrink-0 mt-0.5">
+                    <ShieldAlert className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <h3 className="text-sm sm:text-base font-black text-[#92400E] uppercase tracking-wide">
+                        PRODUCTO YA CONTADO EN ORIGEN
+                      </h3>
+                      <span className="text-[10px] font-bold uppercase bg-amber-200 text-[#78350F] px-2 py-0.5 rounded-full flex items-center gap-1">
+                        <Lock className="w-3 h-3" /> Bloqueado
+                      </span>
+                    </div>
+                    <p className="text-xs text-[#B45309] font-medium mt-1">
+                      Este producto ya fue registrado en la auditoría. Para prevenir duplicados involuntarios, el registro se encuentra bloqueado.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Cuadro de Auditor y Fecha */}
+              <div className="bg-white/95 border border-amber-200 rounded-[8px] p-3 grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                <div className="flex items-center gap-2.5">
+                  <div className="p-2 bg-blue-50 text-[#263988] rounded-[6px]">
+                    <User className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <span className="text-[10px] uppercase font-bold text-[#6B7280] block">Auditado por</span>
+                    <span className="font-bold text-[#1F2937] text-sm">
+                      {isLoadingAuditLog ? (
+                        <span className="inline-flex items-center gap-1 text-[#6B7280]">
+                          <RefreshCw className="w-3 h-3 animate-spin" /> Verificando auditor...
+                        </span>
+                      ) : (
+                        auditLogInfo?.auditorName || activeTask.lastAuditorName || activeTask.LastAuditorName || 'Auditor Registrado'
+                      )}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2.5">
+                  <div className="p-2 bg-emerald-50 text-[#009045] rounded-[6px]">
+                    <Clock className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <span className="text-[10px] uppercase font-bold text-[#6B7280] block">Fecha y Hora de Conteo</span>
+                    <span className="font-bold text-[#1F2937] text-xs sm:text-sm font-mono">
+                      {formatAuditDate(auditLogInfo?.countedAt || activeTask.UpdatedAt || activeTask.updatedAt)}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Cuadro de Cantidades Registradas */}
+              <div className="grid grid-cols-3 gap-2 text-center">
+                <div className="p-2.5 bg-white rounded-[8px] border border-amber-200">
+                  <span className="text-[10px] uppercase font-bold text-[#6B7280] block">Sistema (S)</span>
+                  <span className="text-base sm:text-lg font-black font-mono text-[#1F2937] mt-0.5 block">
+                    {Number(activeTask.SystemQuantity ?? activeTask.systemQuantity ?? 0).toFixed(2)}
+                  </span>
+                  <span className="text-[9px] text-[#6B7280]">Existencia ERP</span>
+                </div>
+                <div className="p-2.5 bg-white rounded-[8px] border border-amber-200">
+                  <span className="text-[10px] uppercase font-bold text-[#6B7280] block">Contado (Qc)</span>
+                  <span className="text-base sm:text-lg font-black font-mono text-[#263988] mt-0.5 block">
+                    {Number(activeTask.CountedQuantity ?? activeTask.countedQuantity ?? 0).toFixed(2)}
+                  </span>
+                  <span className="text-[9px] text-[#263988] font-semibold">Físico registrado</span>
+                </div>
+                <div className="p-2.5 bg-white rounded-[8px] border border-amber-200">
+                  <span className="text-[10px] uppercase font-bold text-[#6B7280] block">Diferencia</span>
+                  <span
+                    className={`text-base sm:text-lg font-black font-mono mt-0.5 block ${
+                      Number(activeTask.Discrepancy ?? 0) === 0
+                        ? 'text-[#009045]'
+                        : Number(activeTask.Discrepancy ?? 0) < 0
+                        ? 'text-[#DC2626]'
+                        : 'text-[#F59E0B]'
+                    }`}
+                  >
+                    {Number(activeTask.Discrepancy ?? 0) > 0
+                      ? `+${Number(activeTask.Discrepancy ?? 0).toFixed(2)}`
+                      : Number(activeTask.Discrepancy ?? 0).toFixed(2)}
+                  </span>
+                  <span className="text-[9px] text-[#6B7280]">
+                    {Number(activeTask.Discrepancy ?? 0) === 0
+                      ? 'Cuadrado'
+                      : Number(activeTask.Discrepancy ?? 0) < 0
+                      ? 'Faltante'
+                      : 'Sobrante'}
+                  </span>
+                </div>
+              </div>
+
+              {/* Botones de Acción */}
+              <div className="flex flex-col sm:flex-row gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setShowRecountModal(true)}
+                  className="flex-1 btn-collector bg-[#F59E0B] hover:bg-[#D97706] text-white min-h-[46px] px-4 rounded-[8px] font-black text-xs sm:text-sm flex items-center justify-center gap-2 transition active:scale-95 shadow-xs"
+                >
+                  <RotateCcw className="w-4 h-4" />
+                  <span>VOLVER A CONTAR (RE-AUDITORÍA)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={clearActiveTask}
+                  className="btn-collector bg-white hover:bg-gray-100 text-[#1F2937] border border-[#E5E7EB] min-h-[46px] px-4 rounded-[8px] font-bold text-xs sm:text-sm transition"
+                >
+                  <span>Cerrar / Seleccionar otro SKU</span>
+                </button>
+              </div>
+            </div>
+          ) : (
+            /* CASO 2: FORMULARIO DE CONTEO HABILITADO */
+            <>
+              {/* Banner de Modo Re-auditoría si se desbloqueó */}
+              {isAlreadyCounted && isRecountAllowed && (
+                <div className="p-3 bg-amber-50 border border-amber-300 rounded-[8px] flex items-center justify-between text-xs text-[#92400E]">
+                  <div className="flex items-center gap-2">
+                    <Unlock className="w-4 h-4 text-[#D97706]" />
+                    <span className="font-bold">Modo Re-auditoría Habilitado: Actualizando conteo anterior</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsRecountAllowed(false)}
+                    className="text-[11px] font-bold text-[#DC2626] hover:underline flex items-center gap-1"
+                  >
+                    <Lock className="w-3 h-3" />
+                    <span>Bloquear</span>
+                  </button>
+                </div>
+              )}
+
+              {/* Tarjeta de Existencia en Sistema (S) con ajuste asistido si la API falla */}
+              <div className="bg-[#F8F9FA] p-3 sm:p-4 rounded-[8px] border border-[#E5E7EB] flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-center sm:text-left">
+                {isEditingSystemQty ? (
+                  <div className="p-3 bg-white rounded-[8px] border-2 border-[#263988] shadow-xs flex-1">
+                    <span className="text-xs text-[#263988] uppercase font-black block tracking-wider">
+                      Ajustar Cantidad de Sistema (S)
+                    </span>
+                    <div className="mt-2 flex items-center gap-2">
+                      <input
+                        type="number"
+                        step="any"
+                        min="0"
+                        value={tempSystemQtyInput}
+                        onChange={(e) => setTempSystemQtyInput(e.target.value)}
+                        className="flex-1 px-3 py-1.5 text-center sm:text-left text-lg font-black font-mono border border-[#263988] rounded-[6px] focus:outline-hidden"
+                        autoFocus
+                        placeholder="0.00"
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            const parsed = parseFloat(tempSystemQtyInput);
+                            if (!isNaN(parsed) && parsed >= 0) {
+                              setManualSystemQty(parsed);
+                              setIsEditingSystemQty(false);
+                            }
+                          } else if (e.key === 'Escape') {
+                            setIsEditingSystemQty(false);
+                          }
+                        }}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const parsed = parseFloat(tempSystemQtyInput);
+                          if (!isNaN(parsed) && parsed >= 0) {
+                            setManualSystemQty(parsed);
+                            setIsEditingSystemQty(false);
+                          }
+                        }}
+                        className="px-3 py-2 bg-[#009045] text-white rounded-[6px] hover:bg-[#007a3a] font-bold text-xs"
+                        title="Confirmar ajuste de sistema"
+                      >
+                        Guardar
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setIsEditingSystemQty(false)}
+                        className="px-3 py-2 bg-[#E5E7EB] text-[#1F2937] rounded-[6px] hover:bg-gray-300 font-bold text-xs"
+                        title="Cancelar"
+                      >
+                        Cancelar
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex-1 flex items-center justify-between">
+                    <div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-xs text-[#6B7280] uppercase font-black tracking-wider flex items-center gap-1">
+                          Existencia en Sistema (S)
+                        </span>
+                        {isLiveFetching && <RefreshCw className="w-3.5 h-3.5 animate-spin text-[#263988]" />}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTempSystemQtyInput(String(finalSystemQty));
+                            setIsEditingSystemQty(true);
+                          }}
+                          className="p-1 text-[#6B7280] hover:text-[#263988] bg-white border border-[#E5E7EB] rounded-[6px] transition flex items-center gap-1 text-[11px] font-bold ml-1"
+                          title="Modificar cantidad existente en sistema"
+                        >
+                          <Edit2 className="w-3 h-3" />
+                          <span>Editar</span>
+                        </button>
+                      </div>
+                      <span className="text-[11px] font-bold block mt-0.5">
+                        {isLiveFetching ? (
+                          <span className="text-[#263988]">Consultando API ERP en vivo...</span>
+                        ) : manualSystemQty !== null ? (
+                          <span className="text-[#263988] bg-blue-50 px-2 py-0.5 rounded-full border border-[#263988]/20">Modificado manualmente</span>
+                        ) : liveData.systemQty !== null ? (
+                          <span className="text-[#009045] bg-emerald-50 px-2 py-0.5 rounded-full border border-[#009045]/20">Dato en vivo ERP</span>
+                        ) : (
+                          <span className="text-[#6B7280]">Dato almacenado en misión</span>
+                        )}
+                      </span>
+                    </div>
+                    <div className="text-right">
+                      <span className={`text-2xl sm:text-3xl font-black font-mono block ${isLiveFetching ? 'text-[#6B7280]' : 'text-[#1F2937]'}`}>
+                        {finalSystemQty.toFixed(2)}
+                      </span>
+                      <span className="text-[10px] text-[#6B7280] uppercase font-bold">Unidades teóricas</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Campo Numérico Gigante para "Cantidad Contada Físicamente" */}
+              <div className="space-y-2">
+                <label className="text-xs sm:text-sm font-black text-[#1F2937] uppercase tracking-wider flex items-center justify-between">
+                  <span>CANTIDAD CONTADA FÍSICAMENTE (Qc)</span>
+                  <span className="text-xs text-[#009045] font-bold">Campo obligatorio</span>
+                </label>
+
+                <div className="relative">
                   <input
+                    ref={countInputRef}
                     type="number"
                     step="any"
                     min="0"
-                    value={tempSystemQtyInput}
-                    onChange={(e) => setTempSystemQtyInput(e.target.value)}
-                    className="w-18 px-1 py-0.5 text-center text-sm font-black font-mono border border-[#263988] rounded-[6px] focus:outline-hidden focus:ring-1 focus:ring-[#263988]"
-                    autoFocus
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault();
-                        const parsed = parseFloat(tempSystemQtyInput);
-                        if (!isNaN(parsed) && parsed >= 0) {
-                          setManualSystemQty(parsed);
-                          setIsEditingSystemQty(false);
-                        }
-                      } else if (e.key === 'Escape') {
-                        setIsEditingSystemQty(false);
-                      }
-                    }}
+                    value={countedInput}
+                    onChange={(e) => setCountedInput(e.target.value)}
+                    disabled={isLiveFetching}
+                    placeholder="0.00"
+                    className="w-full h-20 sm:h-24 px-4 bg-[#F8F9FA] border-3 border-[#009045] disabled:opacity-50 focus:border-[#009045] rounded-[8px] text-[#1F2937] font-mono text-3xl sm:text-5xl font-black text-center shadow-inner focus:outline-hidden"
                   />
+                </div>
+
+                {/* Teclado de Incrementos Rápidos Táctiles */}
+                <div className="grid grid-cols-6 gap-2 pt-1">
                   <button
                     type="button"
-                    onClick={() => {
-                      const parsed = parseFloat(tempSystemQtyInput);
-                      if (!isNaN(parsed) && parsed >= 0) {
-                        setManualSystemQty(parsed);
-                        setIsEditingSystemQty(false);
-                      }
-                    }}
-                    className="p-1 bg-[#009045] text-white rounded-[6px] hover:bg-[#007a3a]"
-                    title="Confirmar ajuste de sistema"
+                    onClick={() => adjustCount(1)}
+                    disabled={isLiveFetching}
+                    className="btn-collector bg-white hover:bg-[#F8F9FA] border border-[#E5E7EB] disabled:opacity-50 text-[#1F2937] min-h-[48px] rounded-[8px] font-black text-base active:scale-95"
                   >
-                    <Check className="w-3.5 h-3.5" />
+                    +1
                   </button>
                   <button
                     type="button"
-                    onClick={() => setIsEditingSystemQty(false)}
-                    className="p-1 bg-[#E5E7EB] text-[#1F2937] rounded-[6px] hover:bg-gray-300"
-                    title="Cancelar"
+                    onClick={() => adjustCount(5)}
+                    disabled={isLiveFetching}
+                    className="btn-collector bg-white hover:bg-[#F8F9FA] border border-[#E5E7EB] disabled:opacity-50 text-[#1F2937] min-h-[48px] rounded-[8px] font-black text-base active:scale-95"
                   >
-                    <X className="w-3.5 h-3.5" />
+                    +5
                   </button>
-                </div>
-                <span className="text-[9px] text-[#6B7280] block mt-0.5">Enter para guardar</span>
-              </div>
-            ) : (
-              <div className="p-2 bg-white rounded-[8px] border border-[#E5E7EB] relative group">
-                <div className="flex items-center justify-center gap-1">
-                  <span className="text-[10px] sm:text-xs text-[#6B7280] uppercase font-black tracking-wider flex items-center gap-1">
-                    Sistema (S) {isLiveFetching && <RefreshCw className="w-3 h-3 animate-spin text-[#263988]" />}
-                  </span>
                   <button
                     type="button"
-                    onClick={() => {
-                      setTempSystemQtyInput(String(finalSystemQty));
-                      setIsEditingSystemQty(true);
-                    }}
-                    className="p-0.5 text-[#6B7280] hover:text-[#263988] rounded transition"
-                    title="Modificar cantidad existente en sistema"
+                    onClick={() => adjustCount(10)}
+                    disabled={isLiveFetching}
+                    className="btn-collector bg-white hover:bg-[#F8F9FA] border border-[#E5E7EB] disabled:opacity-50 text-[#1F2937] min-h-[48px] rounded-[8px] font-black text-base active:scale-95"
                   >
-                    <Edit2 className="w-3 h-3" />
+                    +10
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => adjustCount(25)}
+                    disabled={isLiveFetching}
+                    className="btn-collector bg-white hover:bg-[#F8F9FA] border border-[#E5E7EB] disabled:opacity-50 text-[#1F2937] min-h-[48px] rounded-[8px] font-black text-base active:scale-95"
+                  >
+                    +25
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => adjustCount(-1)}
+                    disabled={isLiveFetching}
+                    className="btn-collector bg-white hover:bg-[#F8F9FA] border border-[#E5E7EB] disabled:opacity-50 text-[#1F2937] min-h-[48px] rounded-[8px] font-black text-base active:scale-95"
+                  >
+                    -1
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setCountedInput('')}
+                    disabled={isLiveFetching}
+                    className="btn-collector bg-red-50 hover:bg-red-100 disabled:opacity-50 border border-red-200 text-[#DC2626] min-h-[48px] rounded-[8px] font-bold flex items-center justify-center text-xs active:scale-95"
+                  >
+                    <RotateCcw className="w-4 h-4" />
                   </button>
                 </div>
-                <span className={`text-xl sm:text-2xl font-black font-mono mt-1 block transition-colors ${isLiveFetching ? 'text-[#6B7280]' : 'text-[#1F2937]'}`}>
-                  {finalSystemQty.toFixed(2)}
-                </span>
-                <span className="text-[10px] font-bold block">
-                  {isLiveFetching ? (
-                    <span className="text-[#263988]">Consultando API...</span>
-                  ) : manualSystemQty !== null ? (
-                    <span className="text-[#263988] bg-blue-50 px-1 py-0.2 rounded-full border border-[#263988]/20">Modificado manual</span>
-                  ) : liveData.systemQty !== null ? (
-                    <span className="text-[#009045] bg-emerald-50 px-1 py-0.2 rounded-full border border-[#009045]/20">Dato en vivo ERP</span>
-                  ) : (
-                    <span className="text-[#6B7280]">Dato almacenado</span>
-                  )}
-                </span>
               </div>
-            )}
 
-            <div className="p-2 bg-white rounded-[8px] border border-[#E5E7EB]">
-              <span className="text-[10px] sm:text-xs text-[#F59E0B] uppercase font-black block tracking-wider">
-                Ventas Hoy (V)
-              </span>
-              <span className="text-xl sm:text-2xl font-black text-[#F59E0B] font-mono mt-1 block">
-                {salesQty.toFixed(2)}
-              </span>
-              <span className="text-[10px] text-[#6B7280]">Facturadas</span>
-            </div>
+              {/* Banner de Previsualización Dinámica del Resultado */}
+              {isCountValid && !isLiveFetching && (
+                <div
+                  className={`p-4 rounded-[8px] border-2 flex items-center justify-between transition ${
+                    isExactMatch
+                      ? 'bg-emerald-50 border-[#009045] text-[#009045]'
+                      : 'bg-amber-50 border-[#F59E0B] text-[#1F2937]'
+                  }`}
+                >
+                  <div className="flex items-center gap-2.5">
+                    {isExactMatch ? (
+                      <CheckCircle2 className="w-6 h-6 text-[#009045] shrink-0" />
+                    ) : (
+                      <AlertTriangle className="w-6 h-6 text-[#F59E0B] shrink-0" />
+                    )}
+                    <div>
+                      <span className="text-xs uppercase font-bold tracking-wider block">
+                        {isExactMatch ? 'Coincidencia Exacta' : 'Discrepancia Calculada'}
+                      </span>
+                      <span className="text-sm font-semibold">
+                        {isExactMatch
+                          ? 'El conteo físico coincide al 100% con el sistema.'
+                          : liveDiscrepancy < 0
+                          ? `Faltante de ${Math.abs(liveDiscrepancy).toFixed(2)} unidades en origen.`
+                          : `Sobrante de ${liveDiscrepancy.toFixed(2)} unidades en origen.`}
+                      </span>
+                    </div>
+                  </div>
 
-            <div className="p-2 bg-white rounded-[8px] border border-[#263988]/30">
-              <span className="text-[10px] sm:text-xs text-[#263988] uppercase font-black block tracking-wider">
-                Teórico (S - V)
-              </span>
-              <span className="text-xl sm:text-2xl font-black text-[#263988] font-mono mt-1 block">
-                {adjustedTheoretical.toFixed(2)}
-              </span>
-              <span className="text-[10px] text-[#263988]/80">Ajustado</span>
-            </div>
-          </div>
-
-          {/* Campo Numérico Gigante para "Cantidad Contada Físicamente" */}
-          <div className="space-y-2">
-            <label className="text-xs sm:text-sm font-black text-[#1F2937] uppercase tracking-wider flex items-center justify-between">
-              <span>CANTIDAD CONTADA FÍSICAMENTE (Qc)</span>
-              <span className="text-xs text-[#009045] font-bold">Campo obligatorio</span>
-            </label>
-
-            <div className="relative">
-              <input
-                ref={countInputRef}
-                type="number"
-                step="any"
-                min="0"
-                value={countedInput}
-                onChange={(e) => setCountedInput(e.target.value)}
-                disabled={isLiveFetching}
-                placeholder="0.00"
-                className="w-full h-20 sm:h-24 px-4 bg-[#F8F9FA] border-3 border-[#009045] disabled:opacity-50 focus:border-[#009045] rounded-[8px] text-[#1F2937] font-mono text-3xl sm:text-5xl font-black text-center shadow-inner focus:outline-hidden"
-              />
-            </div>
-
-            {/* Teclado de Incrementos Rápidos Táctiles */}
-            <div className="grid grid-cols-6 gap-2 pt-1">
-              <button
-                type="button"
-                onClick={() => adjustCount(1)}
-                disabled={isLiveFetching}
-                className="btn-collector bg-white hover:bg-[#F8F9FA] border border-[#E5E7EB] disabled:opacity-50 text-[#1F2937] min-h-[48px] rounded-[8px] font-black text-base active:scale-95"
-              >
-                +1
-              </button>
-              <button
-                type="button"
-                onClick={() => adjustCount(5)}
-                disabled={isLiveFetching}
-                className="btn-collector bg-white hover:bg-[#F8F9FA] border border-[#E5E7EB] disabled:opacity-50 text-[#1F2937] min-h-[48px] rounded-[8px] font-black text-base active:scale-95"
-              >
-                +5
-              </button>
-              <button
-                type="button"
-                onClick={() => adjustCount(10)}
-                disabled={isLiveFetching}
-                className="btn-collector bg-white hover:bg-[#F8F9FA] border border-[#E5E7EB] disabled:opacity-50 text-[#1F2937] min-h-[48px] rounded-[8px] font-black text-base active:scale-95"
-              >
-                +10
-              </button>
-              <button
-                type="button"
-                onClick={() => adjustCount(25)}
-                disabled={isLiveFetching}
-                className="btn-collector bg-white hover:bg-[#F8F9FA] border border-[#E5E7EB] disabled:opacity-50 text-[#1F2937] min-h-[48px] rounded-[8px] font-black text-base active:scale-95"
-              >
-                +25
-              </button>
-              <button
-                type="button"
-                onClick={() => adjustCount(-1)}
-                disabled={isLiveFetching}
-                className="btn-collector bg-white hover:bg-[#F8F9FA] border border-[#E5E7EB] disabled:opacity-50 text-[#1F2937] min-h-[48px] rounded-[8px] font-black text-base active:scale-95"
-              >
-                -1
-              </button>
-              <button
-                type="button"
-                onClick={() => setCountedInput('')}
-                disabled={isLiveFetching}
-                className="btn-collector bg-red-50 hover:bg-red-100 disabled:opacity-50 border border-red-200 text-[#DC2626] min-h-[48px] rounded-[8px] font-bold flex items-center justify-center text-xs active:scale-95"
-              >
-                <RotateCcw className="w-4 h-4" />
-              </button>
-            </div>
-          </div>
-
-          {/* Campo de Ventas Durante Auditoría */}
-          <div>
-            <label className="block text-xs font-bold text-[#1F2937] mb-1.5 flex items-center justify-between">
-              <span>VENTAS REGISTRADAS DURANTE LA AUDITORÍA:</span>
-              <span className="text-[11px] text-[#F59E0B] font-normal">Resta al inventario del sistema</span>
-            </label>
-            <input
-              type="number"
-              step="any"
-              min="0"
-              value={salesInput}
-              onChange={(e) => setSalesInput(e.target.value)}
-              disabled={isLiveFetching}
-              className="w-full h-12 px-4 bg-white border border-[#E5E7EB] disabled:opacity-50 rounded-[8px] text-[#F59E0B] font-mono text-xl font-black text-center focus:outline-hidden focus:border-[#F59E0B]"
-            />
-          </div>
-
-          {/* Banner de Previsualización Dinámica del Resultado */}
-          {isCountValid && !isLiveFetching && (
-            <div
-              className={`p-4 rounded-[8px] border-2 flex items-center justify-between transition ${
-                isExactMatch
-                  ? 'bg-emerald-50 border-[#009045] text-[#009045]'
-                  : 'bg-amber-50 border-[#F59E0B] text-[#1F2937]'
-              }`}
-            >
-              <div className="flex items-center gap-2.5">
-                {isExactMatch ? (
-                  <CheckCircle2 className="w-6 h-6 text-[#009045] shrink-0" />
-                ) : (
-                  <AlertTriangle className="w-6 h-6 text-[#F59E0B] shrink-0" />
-                )}
-                <div>
-                  <span className="text-xs uppercase font-bold tracking-wider block">
-                    {isExactMatch ? 'Coincidencia Exacta' : 'Discrepancia Calculada'}
-                  </span>
-                  <span className="text-sm font-semibold">
-                    {isExactMatch
-                      ? 'El conteo físico coincide al 100% con el teórico ajustado.'
-                      : liveDiscrepancy < 0
-                      ? `Faltante de ${Math.abs(liveDiscrepancy).toFixed(2)} unidades en origen.`
-                      : `Sobrante de ${liveDiscrepancy.toFixed(2)} unidades en origen.`}
-                  </span>
+                  <div className="text-right pl-3 shrink-0">
+                    <span className="font-mono text-2xl font-black">
+                      {liveDiscrepancy > 0 ? `+${liveDiscrepancy.toFixed(2)}` : liveDiscrepancy.toFixed(2)}
+                    </span>
+                    <span className="text-[10px] block uppercase font-bold text-[#6B7280]">Diferencia</span>
+                  </div>
                 </div>
-              </div>
+              )}
 
-              <div className="text-right pl-3 shrink-0">
-                <span className="font-mono text-2xl font-black">
-                  {liveDiscrepancy > 0 ? `+${liveDiscrepancy.toFixed(2)}` : liveDiscrepancy.toFixed(2)}
+              {/* BOTÓN DE GUARDADO RÁPIDO */}
+              <button
+                onClick={handleRegisterCount}
+                disabled={!isCountValid || isSubmitting || isLiveFetching}
+                className="w-full min-h-[58px] bg-[#009045] hover:bg-[#007a3a] disabled:opacity-50 disabled:pointer-events-none active:scale-[0.98] text-white font-black text-lg sm:text-xl rounded-[8px] shadow-md flex items-center justify-center gap-3 transition touch-manipulation"
+              >
+                {isLiveFetching ? <RefreshCw className="w-6 h-6 animate-spin" /> : <CheckCircle2 className="w-6 h-6" />}
+                <span>
+                  {isLiveFetching
+                    ? 'ESPERANDO ERP...'
+                    : isSubmitting
+                    ? 'REGISTRANDO...'
+                    : isAlreadyCounted
+                    ? 'ACTUALIZAR CONTEO'
+                    : 'REGISTRAR CONTEO'}
                 </span>
-                <span className="text-[10px] block uppercase font-bold text-[#6B7280]">Diferencia</span>
-              </div>
-            </div>
+              </button>
+            </>
           )}
-
-          {/* BOTÓN DE GUARDADO RÁPIDO */}
-          <button
-            onClick={handleRegisterCount}
-            disabled={!isCountValid || isSubmitting || isLiveFetching}
-            className="w-full min-h-[58px] bg-[#009045] hover:bg-[#007a3a] disabled:opacity-50 disabled:pointer-events-none active:scale-[0.98] text-white font-black text-lg sm:text-xl rounded-[8px] shadow-md flex items-center justify-center gap-3 transition touch-manipulation"
-          >
-            {isLiveFetching ? <RefreshCw className="w-6 h-6 animate-spin" /> : <CheckCircle2 className="w-6 h-6" />}
-            <span>{isLiveFetching ? 'ESPERANDO ERP...' : isSubmitting ? 'REGISTRANDO...' : 'REGISTRAR CONTEO'}</span>
-          </button>
         </div>
       ) : (
         /* Estado Vacío - Esperando Escaneo */
@@ -1041,6 +1257,70 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* MODAL DE CONFIRMACIÓN EXPRESA PARA RE-CONTEO */}
+      {showRecountModal && activeTask && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-fadeIn">
+          <div className="bg-white rounded-[16px] max-w-md w-full p-5 sm:p-6 space-y-4 modal-elevation border border-[#E5E7EB]">
+            <div className="flex items-center gap-3">
+              <div className="p-3 bg-amber-100 rounded-full text-[#D97706] shrink-0">
+                <AlertTriangle className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="text-base font-black text-[#1F2937]">Confirmar Re-conteo</h3>
+                <p className="text-xs text-[#6B7280]">Acción de re-auditoría sobre SKU ya registrado</p>
+              </div>
+            </div>
+
+            <div className="bg-[#F8F9FA] rounded-[8px] p-3 text-xs space-y-1.5 border border-[#E5E7EB]">
+              <p className="text-[#4B5563]">
+                Este SKU (<strong>{activeTask.SkuCode || activeTask.skuCode}</strong>) ya fue auditado por{' '}
+                <strong className="text-[#1F2937]">
+                  {auditLogInfo?.auditorName || activeTask.lastAuditorName || activeTask.LastAuditorName || 'el auditor'}
+                </strong>{' '}
+                el{' '}
+                <strong className="text-[#1F2937]">
+                  {formatAuditDate(auditLogInfo?.countedAt || activeTask.UpdatedAt || activeTask.updatedAt)}
+                </strong>.
+              </p>
+              <div className="flex items-center justify-between pt-1 font-mono text-xs font-bold text-[#6B7280]">
+                <span>Conteo previo: {Number(activeTask.CountedQuantity ?? activeTask.countedQuantity ?? 0).toFixed(2)} u</span>
+                <span>Sistema: {Number(activeTask.SystemQuantity ?? activeTask.systemQuantity ?? 0).toFixed(2)} u</span>
+              </div>
+            </div>
+
+            <p className="text-xs text-[#DC2626] font-semibold bg-red-50 p-2.5 rounded-[8px] border border-red-200">
+              ¿Está seguro que desea habilitar el re-conteo? Al guardar, el conteo anterior será reemplazado en la base de datos de Supabase.
+            </p>
+
+            <div className="flex gap-2.5 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowRecountModal(false)}
+                className="flex-1 min-h-[44px] bg-[#F8F9FA] hover:bg-[#E5E7EB] text-[#1F2937] font-bold text-xs rounded-[8px] border border-[#E5E7EB] transition"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowRecountModal(false);
+                  setIsRecountAllowed(true);
+                  showToastBanner('Formulario desbloqueado para re-conteo', 'warning');
+                  setTimeout(() => {
+                    countInputRef.current?.focus();
+                    countInputRef.current?.select();
+                  }, 50);
+                }}
+                className="flex-1 min-h-[44px] bg-[#009045] hover:bg-[#007a3a] text-white font-black text-xs rounded-[8px] shadow-xs active:scale-95 transition flex items-center justify-center gap-1.5"
+              >
+                <Unlock className="w-4 h-4" />
+                <span>Sí, volver a contar</span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

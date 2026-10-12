@@ -14,7 +14,9 @@ import {
   Store,
   Layers,
   X,
-  ArrowRightLeft
+  ArrowRightLeft,
+  Edit2,
+  Check
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { useMissionStore } from '../store/useMissionStore';
@@ -26,7 +28,7 @@ import { useAuthStore } from '../stores/useAuthStore';
 
 export const TabFloorReconciliation: React.FC = () => {
   const isOnline = useOnlineStatus();
-  const { activeMissionId, fetchMissionTasks } = useMissionStore();
+  const { activeMissionId, fetchMissionTasks, tasks } = useMissionStore();
   const user = useAuthStore((state) => state.user);
 
   const {
@@ -40,6 +42,9 @@ export const TabFloorReconciliation: React.FC = () => {
   const [selectedDiscrepancy, setSelectedDiscrepancy] = useState<FloorDiscrepancy | null>(null);
   const [floorCountedInput, setFloorCountedInput] = useState<string>('');
   const [floorSystemInput, setFloorSystemInput] = useState<string>('0');
+  const [apiFetchFailed, setApiFetchFailed] = useState<boolean>(false);
+  const [isEditingFloorSystem, setIsEditingFloorSystem] = useState<boolean>(false);
+  const [tempFloorSystemInput, setTempFloorSystemInput] = useState<string>('');
 
   // Estados de carga e interfaz
   const [isLoading, setIsLoading] = useState<boolean>(false);
@@ -55,6 +60,12 @@ export const TabFloorReconciliation: React.FC = () => {
 
     setIsLoading(true);
     try {
+      // Garantizar que las tareas de la misión estén cargadas para resolver nombres de productos
+      let currentTasks = useMissionStore.getState().tasks;
+      if (currentTasks.length === 0) {
+        currentTasks = await fetchMissionTasks(activeMissionId);
+      }
+
       // 1. Carga de Discrepancias Pendientes en Piso
       const { data, error } = await supabase
         .from('Read_Floor_Discrepancies')
@@ -66,14 +77,69 @@ export const TabFloorReconciliation: React.FC = () => {
       if (error) {
         console.warn('[TabFloorReconciliation] Error BD Discrepancias:', error);
       } else if (data) {
+        // Diccionario de nombres reales desde las tareas de inventario
+        const taskNameMap: Record<string, string> = {};
+        for (const t of currentTasks) {
+          const s = (t.SkuCode || t.skuCode || '').trim();
+          const desc = t.SkuDescription || t.skuDescription;
+          if (s && desc && desc.trim() !== s) {
+            taskNameMap[s] = desc.trim();
+          }
+        }
+
+        // Si hay SKUs sin descripción en memoria, consultar directamente Read_Mission_Tasks
+        const missingSkus = data
+          .map((d) => (d.SkuCode || d.skuCode || '').trim())
+          .filter((s) => s && !taskNameMap[s]);
+
+        if (missingSkus.length > 0) {
+          const { data: dbTasks } = await supabase
+            .from('Read_Mission_Tasks')
+            .select('SkuCode, SkuDescription')
+            .eq('MissionId', activeMissionId)
+            .in('SkuCode', missingSkus);
+
+          if (dbTasks) {
+            for (const dt of dbTasks) {
+              const s = (dt.SkuCode || '').trim();
+              if (s && dt.SkuDescription && dt.SkuDescription.trim() !== s) {
+                taskNameMap[s] = dt.SkuDescription.trim();
+              }
+            }
+          }
+        }
+
         const mappedDiscrepancies: FloorDiscrepancy[] = data.map((d) => {
           const originDisc = Number(d.OriginDiscrepancy ?? d.originDiscrepancy ?? d.WarehouseDiscrepancy ?? 0);
+          const skuTrimmed = (d.SkuCode || d.skuCode || '').trim();
+          const matchingTask = currentTasks.find((t) => (t.SkuCode || t.skuCode || '').trim() === skuTrimmed);
+          
+          const taskName = taskNameMap[skuTrimmed] || matchingTask?.SkuDescription || matchingTask?.skuDescription;
+          const isDbDescReal =
+            d.SkuDescription &&
+            d.SkuDescription.trim() !== skuTrimmed &&
+            !/^\d{1,8}$/.test(d.SkuDescription.trim());
+
+          const realName =
+            (taskName && taskName.trim() !== skuTrimmed ? taskName : null) ||
+            (isDbDescReal ? d.SkuDescription.trim() : null) ||
+            'Artículo auditado';
+
+          // Si en la BD de Supabase se había guardado el SKU redundante como descripción, actualizarlo al nombre real
+          if (realName !== 'Artículo auditado' && (!d.SkuDescription || d.SkuDescription.trim() === skuTrimmed)) {
+            supabase
+              .from('Read_Floor_Discrepancies')
+              .update({ SkuDescription: realName })
+              .eq('DiscrepancyId', d.DiscrepancyId)
+              .then();
+          }
+
           return {
             discrepancyId: d.DiscrepancyId || d.discrepancyId,
-            taskId: d.TaskId || d.taskId || '',
+            taskId: d.TaskId || d.taskId || matchingTask?.TaskId || '',
             missionId: d.MissionId || d.missionId || activeMissionId,
             skuCode: d.SkuCode || d.skuCode || '',
-            skuDescription: d.SkuDescription || d.skuDescription || 'Artículo',
+            skuDescription: realName,
             originDeposit: d.OriginDeposit || d.originDeposit || '150101',
             targetDeposit: d.TargetDeposit || d.targetDeposit || d.FloorDeposit || '150103',
             originDiscrepancy: originDisc,
@@ -104,17 +170,20 @@ export const TabFloorReconciliation: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [activeMissionId, setPendingDiscrepancies, setVirtualTransfers]);
+  }, [activeMissionId, fetchMissionTasks, setPendingDiscrepancies, setVirtualTransfers]);
 
   useEffect(() => {
     fetchOpenDiscrepancies();
-  }, [fetchOpenDiscrepancies]);
+  }, [fetchOpenDiscrepancies, tasks.length]);
 
   // AL DAR CLIC EN VERIFICAR: Consulta la API en tiempo real
   const handleSelectDiscrepancy = async (disc: FloorDiscrepancy) => {
     setSelectedDiscrepancy(disc);
     setFloorCountedInput('');
-    setFloorSystemInput('0'); // Valor por defecto
+    setFloorSystemInput('0');
+    setApiFetchFailed(false);
+    setIsEditingFloorSystem(false);
+    setTempFloorSystemInput('');
     setIsFetchingLive(true);
 
     try {
@@ -123,15 +192,27 @@ export const TabFloorReconciliation: React.FC = () => {
         const json = await res.json();
         if (json.success && json.data) {
           const targetItem = json.data.find((d: any) => d.codigo_deposito === disc.targetDeposit);
-          setFloorSystemInput(targetItem ? String(targetItem.stock_quantity) : '0');
+          if (targetItem) {
+            setFloorSystemInput(String(targetItem.stock_quantity));
+            setApiFetchFailed(false);
+          } else {
+            // No se encontró stock para el depósito destino en el ERP
+            setFloorSystemInput(String(disc.targetSystemQuantity || 0));
+            setApiFetchFailed(true);
+          }
+        } else {
+          setFloorSystemInput(String(disc.targetSystemQuantity || 0));
+          setApiFetchFailed(true);
         }
       } else {
         // Fallback al valor teórico guardado si falla la API
         setFloorSystemInput(String(disc.targetSystemQuantity || 0));
+        setApiFetchFailed(true);
       }
     } catch (err) {
       console.warn('Fallo API destino:', err);
       setFloorSystemInput(String(disc.targetSystemQuantity || 0));
+      setApiFetchFailed(true);
     } finally {
       setIsFetchingLive(false);
     }
@@ -161,7 +242,12 @@ export const TabFloorReconciliation: React.FC = () => {
     setIsSubmitting(true);
     const discId = selectedDiscrepancy.discrepancyId || '';
     const skuCode = selectedDiscrepancy.skuCode || '';
-    const skuDesc = selectedDiscrepancy.skuDescription || '';
+    const matchingTask = tasks.find((t) => (t.SkuCode || t.skuCode || '').trim() === (skuCode || '').trim());
+    const realSkuDesc =
+      matchingTask?.SkuDescription ||
+      matchingTask?.skuDescription ||
+      (selectedDiscrepancy.skuDescription && selectedDiscrepancy.skuDescription !== skuCode ? selectedDiscrepancy.skuDescription : '') ||
+      'Artículo auditado';
 
     // Tu lógica de objeto virtual para la UI
     let virtualTransfer: VirtualTransfer | undefined;
@@ -169,9 +255,9 @@ export const TabFloorReconciliation: React.FC = () => {
       virtualTransfer = {
         TransferId: crypto.randomUUID ? crypto.randomUUID() : `trans_${Date.now()}`,
         MissionId: activeMissionId,
-        TaskId: selectedDiscrepancy.taskId || '',
+        TaskId: selectedDiscrepancy.taskId || matchingTask?.TaskId || '',
         SkuCode: skuCode,
-        SkuDescription: skuDesc,
+        SkuDescription: realSkuDesc,
         OriginDeposit: selectedDiscrepancy.originDeposit || '150101',
         DestinationDeposit: selectedDiscrepancy.targetDeposit || '150103',
         TransferredQuantity: transferQuantity,
@@ -185,7 +271,7 @@ export const TabFloorReconciliation: React.FC = () => {
       discrepancy_id: discId,
       mission_id: activeMissionId,
       sku_code: skuCode,
-      sku_description: skuDesc,
+      sku_description: realSkuDesc,
       origin_deposit: selectedDiscrepancy.originDeposit || '150101',
       target_deposit: selectedDiscrepancy.targetDeposit || '150103',
       warehouse_discrepancy: currentOriginDisc,
@@ -200,18 +286,41 @@ export const TabFloorReconciliation: React.FC = () => {
 
     try {
       if (isOnline && isSupabaseConfigured) {
+        // 1. Actualización directa de la tabla Read_Floor_Discrepancies garantizando persistencia del TargetSystemQuantity y SkuDescription
+        await supabase
+          .from('Read_Floor_Discrepancies')
+          .update({
+            SkuDescription: realSkuDesc,
+            TargetSystemQuantity: floorSystem,
+            TargetCountedQuantity: floorCounted,
+            TargetDiscrepancy: targetDiscrepancyVal,
+            Status: transferQuantity > 0 ? 'PENDING_TRANSFER_APPROVAL' : 'RESOLVED',
+            UpdatedAt: new Date().toISOString(),
+          })
+          .eq('DiscrepancyId', discId);
+
+        // 2. Si hay traslado sugerido, persistirlo de inmediato en Read_Virtual_Transfers según el esquema oficial en /docs
+        if (transferQuantity > 0 && virtualTransfer) {
+          await supabase
+            .from('Read_Virtual_Transfers')
+            .upsert({
+              TransferId: virtualTransfer.TransferId,
+              MissionId: activeMissionId,
+              SkuCode: skuCode,
+              SkuDescription: realSkuDesc,
+              FromDeposit: selectedDiscrepancy.originDeposit || '150101',
+              ToDeposit: selectedDiscrepancy.targetDeposit || '150103',
+              TransitDeposit: '150104',
+              TransferQuantity: transferQuantity,
+              Status: 'SUGGESTED',
+              CreatedAt: new Date().toISOString(),
+              UpdatedAt: new Date().toISOString(),
+            });
+        }
+
         const { error } = await supabase.functions.invoke('register-floor-count', { body: payload });
         if (error) {
-          // Fallback a Base de datos directo si falla la Edge Function
-          await supabase
-            .from('Read_Floor_Discrepancies')
-            .update({
-              TargetCountedQuantity: floorCounted,
-              TargetDiscrepancy: targetDiscrepancyVal,
-              Status: transferQuantity > 0 ? 'PENDING_TRANSFER_APPROVAL' : 'RESOLVED',
-              UpdatedAt: new Date().toISOString(),
-            })
-            .eq('DiscrepancyId', discId);
+          console.warn('[TabFloorReconciliation] Edge function retornó advertencia:', error);
         }
       } else {
         await enqueueOfflineEvent({
@@ -231,6 +340,9 @@ export const TabFloorReconciliation: React.FC = () => {
       );
       setSelectedDiscrepancy(null);
       setFloorCountedInput('');
+      setApiFetchFailed(false);
+      setIsEditingFloorSystem(false);
+      setTempFloorSystemInput('');
 
       // Esperar un segundo y forzar la recarga de todo
       setTimeout(async () => {
@@ -407,7 +519,13 @@ export const TabFloorReconciliation: React.FC = () => {
                 </span>
               </div>
               <h3 className="text-lg sm:text-xl font-black text-[#1F2937] mt-1.5 leading-tight">
-                {selectedDiscrepancy.skuDescription}
+                {(() => {
+                  const skuTrimmed = (selectedDiscrepancy.skuCode || '').trim();
+                  const matchingTask = tasks.find((t) => (t.SkuCode || t.skuCode || '').trim() === skuTrimmed);
+                  const taskDesc = matchingTask?.SkuDescription || matchingTask?.skuDescription;
+                  const isDiscReal = selectedDiscrepancy.skuDescription && selectedDiscrepancy.skuDescription.trim() !== skuTrimmed && !/^\d{1,8}$/.test(selectedDiscrepancy.skuDescription.trim());
+                  return (taskDesc && taskDesc.trim() !== skuTrimmed ? taskDesc : null) || (isDiscReal ? selectedDiscrepancy.skuDescription : null) || 'Artículo auditado';
+                })()}
               </h3>
             </div>
             <button
@@ -436,19 +554,100 @@ export const TabFloorReconciliation: React.FC = () => {
               />
             </div>
             <div>
-              <label className="block text-xs font-bold text-[#6B7280] mb-1.5 uppercase tracking-wider flex justify-between">
-                <span>TEÓRICO ERP ({selectedDiscrepancy.targetDeposit}):</span>
-                {isFetchingLive && <RefreshCw className="w-4 h-4 animate-spin text-[#263988]" />}
-              </label>
-              <div className="w-full h-16 flex items-center justify-center bg-[#F8F9FA] border border-[#E5E7EB] rounded-[8px]">
-                <span
-                  className={`font-mono text-3xl font-black ${
-                    isFetchingLive ? 'text-[#6B7280]' : 'text-[#1F2937]'
-                  }`}
-                >
-                  {isFetchingLive ? '...' : floorSystemInput}
-                </span>
+              <div className="flex justify-between items-center mb-1.5">
+                <label className="text-xs font-bold text-[#6B7280] uppercase tracking-wider flex items-center gap-1.5">
+                  <span>TEÓRICO ERP ({selectedDiscrepancy.targetDeposit || '150103'}):</span>
+                  {!isFetchingLive && (
+                    apiFetchFailed ? (
+                      <span className="text-[10px] text-[#F59E0B] font-bold bg-amber-50 px-2 py-0.5 rounded-full border border-[#F59E0B]/30">
+                        Sin conexión ERP
+                      </span>
+                    ) : (
+                      <span className="text-[10px] text-[#009045] font-bold bg-emerald-50 px-2 py-0.5 rounded-full border border-[#009045]/30">
+                        Dato en vivo ERP
+                      </span>
+                    )
+                  )}
+                </label>
+                <div className="flex items-center gap-1.5">
+                  {isFetchingLive && <RefreshCw className="w-4 h-4 animate-spin text-[#263988]" />}
+                  {apiFetchFailed && !isFetchingLive && !isEditingFloorSystem && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTempFloorSystemInput(floorSystemInput);
+                        setIsEditingFloorSystem(true);
+                      }}
+                      className="px-2 py-0.5 bg-blue-50 hover:bg-blue-100 text-[#263988] border border-[#263988]/30 rounded-[6px] text-[11px] font-bold flex items-center gap-1 transition"
+                      title="Desbloquear para agregar cantidad teórica manualmente por fallo de API"
+                    >
+                      <Edit2 className="w-3 h-3" />
+                      <span>Ajustar</span>
+                    </button>
+                  )}
+                </div>
               </div>
+
+              {isEditingFloorSystem ? (
+                <div className="w-full h-16 flex items-center justify-center bg-white border-2 border-[#263988] rounded-[8px] px-3 gap-2 shadow-xs">
+                  <input
+                    type="number"
+                    step="any"
+                    min="0"
+                    value={tempFloorSystemInput}
+                    onChange={(e) => setTempFloorSystemInput(e.target.value)}
+                    className="w-28 text-center text-2xl font-black font-mono border-b-2 border-[#263988] bg-transparent text-[#1F2937] focus:outline-hidden"
+                    autoFocus
+                    placeholder="0.00"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        const parsed = parseFloat(tempFloorSystemInput);
+                        if (!isNaN(parsed) && parsed >= 0) {
+                          setFloorSystemInput(String(parsed));
+                          setIsEditingFloorSystem(false);
+                        }
+                      } else if (e.key === 'Escape') {
+                        setIsEditingFloorSystem(false);
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const parsed = parseFloat(tempFloorSystemInput);
+                      if (!isNaN(parsed) && parsed >= 0) {
+                        setFloorSystemInput(String(parsed));
+                        setIsEditingFloorSystem(false);
+                      }
+                    }}
+                    className="p-1.5 bg-[#009045] hover:bg-[#007a3a] text-white rounded-[6px] shadow-xs"
+                    title="Confirmar cantidad teórica"
+                  >
+                    <Check className="w-4 h-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsEditingFloorSystem(false)}
+                    className="p-1.5 bg-[#E5E7EB] hover:bg-gray-300 text-[#1F2937] rounded-[6px]"
+                    title="Cancelar"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              ) : (
+                <div className={`w-full h-16 flex items-center justify-center bg-[#F8F9FA] border rounded-[8px] ${
+                  apiFetchFailed ? 'border-[#F59E0B]/40' : 'border-[#E5E7EB]'
+                }`}>
+                  <span
+                    className={`font-mono text-3xl font-black ${
+                      isFetchingLive ? 'text-[#6B7280]' : 'text-[#1F2937]'
+                    }`}
+                  >
+                    {isFetchingLive ? '...' : Number(floorSystemInput).toFixed(2)}
+                  </span>
+                </div>
+              )}
             </div>
           </div>
 
@@ -495,6 +694,17 @@ export const TabFloorReconciliation: React.FC = () => {
               const originDisc = Number(disc.originDiscrepancy || 0);
               const isFaltante = originDisc < 0;
               const isSelected = disc.discrepancyId === selectedDiscrepancy?.discrepancyId;
+              const skuTrimmed = (disc.skuCode || '').trim();
+              const matchingTask = tasks.find((t) => (t.SkuCode || t.skuCode || '').trim() === skuTrimmed);
+              const taskDesc = matchingTask?.SkuDescription || matchingTask?.skuDescription;
+              const isDiscReal =
+                disc.skuDescription &&
+                disc.skuDescription.trim() !== skuTrimmed &&
+                !/^\d{1,8}$/.test(disc.skuDescription.trim());
+              const displayName =
+                (taskDesc && taskDesc.trim() !== skuTrimmed ? taskDesc : null) ||
+                (isDiscReal ? disc.skuDescription : null) ||
+                'Artículo auditado';
 
               return (
                 <div
@@ -506,14 +716,17 @@ export const TabFloorReconciliation: React.FC = () => {
                   }`}
                 >
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                    <div className="space-y-1">
+                    <div className="space-y-1.5">
                       <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-[10px] font-semibold text-[#6B7280]">
-                          Origen: {disc.originDeposit} &rarr; Destino: {disc.targetDeposit}
+                        <span className="text-xs font-mono font-black text-[#263988] bg-blue-50 px-2.5 py-0.5 rounded-full border border-[#263988]/20">
+                          SKU: {disc.skuCode}
+                        </span>
+                        <span className="text-[11px] font-semibold text-[#6B7280]">
+                          Origen: <strong className="text-[#1F2937]">{disc.originDeposit}</strong> &rarr; Destino: <strong className="text-[#1F2937]">{disc.targetDeposit}</strong>
                         </span>
                       </div>
-                      <h4 className="text-base font-bold text-[#1F2937] tracking-tight leading-tight">
-                        {disc.skuDescription}
+                      <h4 className="text-base sm:text-lg font-black text-[#1F2937] tracking-tight leading-tight">
+                        {displayName}
                       </h4>
                     </div>
 
@@ -559,31 +772,43 @@ export const TabFloorReconciliation: React.FC = () => {
             No hay movimientos sugeridos esperando confirmación.
           </div>
         ) : (
-          pendingSuggestedTransfers.map((tr: any) => (
-            <div
-              key={tr.TransferId || tr.transferId}
-              className="bg-white border border-[#E5E7EB] rounded-[12px] p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 card-elevation"
-            >
-              <div>
-                <span className="text-[10px] font-black bg-[#263988]/10 text-[#263988] px-2 py-0.5 rounded-full border border-[#263988]/20">
-                  MOVIMIENTO SUGERIDO PARA CUADRAR
-                </span>
-                <h4 className="text-sm font-black text-[#1F2937] mt-1.5 leading-tight">
-                  {tr.SkuDescription || tr.skuDescription || 'Producto'}
-                </h4>
-                <div className="flex items-center gap-2 mt-2 text-[11px] text-[#6B7280] font-mono font-bold">
-                  <span>
-                    Mover {tr.TransferQuantity || tr.TransferredQuantity || tr.transferredQuantity} u
-                  </span>
-                  <span className="bg-[#F8F9FA] px-1.5 py-0.5 rounded-[8px] border border-[#E5E7EB] text-[#1F2937]">
-                    De: {tr.FromDeposit || tr.OriginDeposit || tr.originDeposit}
-                  </span>
-                  <ArrowRightLeft className="w-3 h-3 text-[#263988]" />
-                  <span className="bg-[#F8F9FA] px-1.5 py-0.5 rounded-[8px] border border-[#E5E7EB] text-[#1F2937]">
-                    A: {tr.ToDeposit || tr.DestinationDeposit || tr.destinationDeposit}
-                  </span>
+          pendingSuggestedTransfers.map((tr: any) => {
+            const trSku = (tr.SkuCode || tr.skuCode || '').trim();
+            const matchingTask = tasks.find((t) => (t.SkuCode || t.skuCode || '').trim() === trSku);
+            const trName = matchingTask?.SkuDescription || matchingTask?.skuDescription || tr.SkuDescription || tr.skuDescription || 'Producto';
+
+            return (
+              <div
+                key={tr.TransferId || tr.transferId}
+                className="bg-white border border-[#E5E7EB] rounded-[12px] p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 card-elevation"
+              >
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {trSku && (
+                      <span className="text-xs font-mono font-black bg-[#263988]/10 text-[#263988] px-2.5 py-0.5 rounded-full border border-[#263988]/20">
+                        SKU: {trSku}
+                      </span>
+                    )}
+                    <span className="text-[10px] font-black bg-amber-50 text-[#D97706] px-2 py-0.5 rounded-full border border-[#D97706]/20">
+                      MOVIMIENTO SUGERIDO PARA CUADRAR
+                    </span>
+                  </div>
+                  <h4 className="text-sm sm:text-base font-black text-[#1F2937] mt-1.5 leading-tight">
+                    {trName}
+                  </h4>
+                  <div className="flex items-center gap-2 mt-2 text-[11px] text-[#6B7280] font-mono font-bold">
+                    <span>
+                      Mover {tr.TransferQuantity || tr.TransferredQuantity || tr.transferredQuantity} u
+                    </span>
+                    <span className="bg-[#F8F9FA] px-1.5 py-0.5 rounded-[8px] border border-[#E5E7EB] text-[#1F2937]">
+                      De: {tr.FromDeposit || tr.OriginDeposit || tr.originDeposit}
+                    </span>
+                    <ArrowRightLeft className="w-3 h-3 text-[#263988]" />
+                    <span className="bg-[#F8F9FA] px-1.5 py-0.5 rounded-[8px] border border-[#E5E7EB] text-[#1F2937]">
+                      A: {tr.ToDeposit || tr.DestinationDeposit || tr.destinationDeposit}
+                    </span>
+                  </div>
                 </div>
-              </div>
               <button
                 onClick={() => handleApproveTransfer(tr)}
                 className="bg-[#263988] hover:bg-[#1d2c6b] text-white px-5 py-2.5 rounded-[8px] font-black text-sm flex items-center justify-center gap-2 active:scale-95 transition shadow-xs w-full sm:w-auto shrink-0"
@@ -591,8 +816,9 @@ export const TabFloorReconciliation: React.FC = () => {
                 <CheckCircle2 className="w-4 h-4" /> CONFIRMAR ERP
               </button>
             </div>
-          ))
-        )}
+          );
+        })
+      )}
       </div>
 
       {/* TOAST FLOTANTE */}
