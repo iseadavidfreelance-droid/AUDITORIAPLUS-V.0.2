@@ -1,0 +1,6 @@
+{
+  "summary": "Plan para ajustar la columna Diferencia en Detalle de Tareas de Inventario y en la base de datos (Read_Mission_Tasks) al confirmar un traslado virtual, calculando la diferencia neta (0.00 si se compensa en su totalidad, o el remanente neto como -1.00) sin modificar el esquema de tablas.",
+  "updatedAt": "2026-10-13T21:22:48.092606007Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

@@ -34,7 +34,7 @@ import { VirtualTransfer, MissionTask, DEPOSIT_NAMES, DepositCode } from '../typ
 import { exportTasksToExcel, ExcelExportMode } from '../lib/exportExcel';
 
 type DifferenceFilter = 'ALL' | 'MISSING' | 'SURPLUS' | 'EXACT';
-type StatusFilter = 'ALL' | 'PENDING' | 'COMPLETED_MATCH' | 'DISCREPANCY_FOUND' | 'RECONCILED' | 'PARTIALLY_RECONCILED';
+type StatusFilter = 'ALL' | 'PENDING' | 'COMPLETED_MATCH' | 'DISCREPANCY_FOUND' | 'RECONCILED';
 
 export const TabReports: React.FC = () => {
   const { activeMissionId, activeMission, metrics, tasks } = useMissionStore();
@@ -89,10 +89,11 @@ export const TabReports: React.FC = () => {
   const discrepantSkus = metrics.discrepantSkus || 0;
   const reconciledSkus = metrics.reconciledSkus || 0;
 
-  // Impacto en Costo ($) reactivo e inmune a sobreescritura de sondeos
+  // Impacto en Costo ($) reactivo e inmune a sobreescritura de sondeos. Tareas TRASLADADAS (RECONCILED) no computan costo.
   const costImpact = useMemo(() => {
     if (tasks && tasks.length > 0) {
       const sum = tasks.reduce((acc, t) => {
+        if (t.Status === 'RECONCILED' || (t as any).Status === 'PARTIALLY_RECONCILED') return acc;
         const disc = Number(t.Discrepancy ?? 0);
         const cost = Number(t.Cost ?? 0);
         return acc + (disc * cost);
@@ -177,7 +178,6 @@ export const TabReports: React.FC = () => {
     else if (statusFilter === 'COMPLETED_MATCH') parts.push('Estado: Coincidencia Exacta');
     else if (statusFilter === 'DISCREPANCY_FOUND') parts.push('Estado: Discrepancias');
     else if (statusFilter === 'RECONCILED') parts.push('Estado: Trasladados');
-    else if (statusFilter === 'PARTIALLY_RECONCILED') parts.push('Estado: Traslado Parcial');
 
     if (taskSearchQuery.trim()) parts.push(`Búsqueda: "${taskSearchQuery.trim()}"`);
 
@@ -339,8 +339,7 @@ export const TabReports: React.FC = () => {
             ${filteredTasks.map((t) => {
               const disc = Number(t.Discrepancy ?? 0);
               let displayStatus: string = t.Status;
-              if (t.Status === 'RECONCILED') displayStatus = 'TRASLADADO';
-              if (t.Status === 'PARTIALLY_RECONCILED') displayStatus = 'TRASLADO PARCIAL';
+              if (t.Status === 'RECONCILED' || (t as any).Status === 'PARTIALLY_RECONCILED') displayStatus = 'TRASLADADO';
 
               return `
               <tr>
@@ -353,7 +352,7 @@ export const TabReports: React.FC = () => {
                   ${disc === 0 ? '0.00' : disc > 0 ? `+${disc.toFixed(2)}` : disc.toFixed(2)}
                 </td>
                 <td>
-                  <span class="badge ${displayStatus === 'COMPLETED_MATCH' || displayStatus === 'TRASLADADO' ? 'badge-match' : displayStatus === 'TRASLADO PARCIAL' ? 'badge-partial' : 'badge-disc'}">
+                  <span class="badge ${displayStatus === 'COMPLETED_MATCH' || displayStatus === 'TRASLADADO' ? 'badge-match' : 'badge-disc'}">
                     ${displayStatus}
                   </span>
                 </td>
@@ -890,8 +889,7 @@ export const TabReports: React.FC = () => {
                     const isCounted = task.CountedQuantity !== null && task.CountedQuantity !== undefined;
 
                     let displayStatus: string = task.Status;
-                    if (task.Status === 'RECONCILED') displayStatus = 'TRASLADADO';
-                    if (task.Status === 'PARTIALLY_RECONCILED') displayStatus = 'TRASLADO PARCIAL';
+                    if (task.Status === 'RECONCILED' || (task as any).Status === 'PARTIALLY_RECONCILED') displayStatus = 'TRASLADADO';
                     if (task.Status === 'COMPLETED_MATCH') displayStatus = 'COINCIDENCIA EXACTA';
                     if (task.Status === 'PENDING') displayStatus = 'PENDIENTE';
                     if (task.Status === 'DISCREPANT') displayStatus = 'DISCREPANCIA';
@@ -928,8 +926,6 @@ export const TabReports: React.FC = () => {
                             className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full border ${
                               displayStatus === 'COINCIDENCIA EXACTA' || displayStatus === 'TRASLADADO'
                                 ? 'bg-emerald-50 text-[#009045] border-[#009045]/30'
-                                : displayStatus === 'TRASLADO PARCIAL'
-                                ? 'bg-blue-50 text-[#263988] border-[#263988]/30'
                                 : displayStatus === 'PENDIENTE'
                                 ? 'bg-[#F8F9FA] text-[#6B7280] border-[#E5E7EB]'
                                 : 'bg-amber-50 text-[#F59E0B] border-[#F59E0B]/30'

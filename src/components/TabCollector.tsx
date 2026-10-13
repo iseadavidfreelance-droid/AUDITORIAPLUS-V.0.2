@@ -36,7 +36,7 @@ import { useMissionStore } from '../store/useMissionStore';
 import { useDiscrepancyStore } from '../stores/useDiscrepancyStore';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
-import { enqueueOfflineEvent } from '../lib/db';
+import { enqueueOfflineEvent, generateUUID } from '../lib/db';
 import { normalizeSku, FloorDiscrepancy } from '../types/audit';
 import { useAuthStore } from '../stores/useAuthStore';
 import { formatDepositLabel } from '../lib/deposits';
@@ -169,8 +169,13 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
       } else {
         // --- INICIO INTERCEPTOR EN VIVO (FASE 2) ---
         setIsLiveFetching(true);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1500);
         try {
-          const res = await fetch(`https://192.168.15.225:3002/api/inventory?search=${normalizedSku}`);
+          const res = await fetch(`https://192.168.15.225:3002/api/inventory?search=${normalizedSku}`, {
+            signal: controller.signal,
+          });
+          clearTimeout(timeoutId);
           
           if (res.ok) {
             const json = await res.json();
@@ -201,8 +206,9 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
             }
           }
         } catch (err) {
-          console.warn('[Interceptor] Fallo al consultar API', err);
-          showToastBanner(`SKU ${task.SkuCode || task.skuCode} cargado. Sin conexión ERP, usando stock almacenado.`, 'warning');
+          clearTimeout(timeoutId);
+          console.warn('[Interceptor] Fallo o timeout al consultar API ERP (1.5s):', err);
+          showToastBanner(`SKU ${task.SkuCode || task.skuCode} cargado. ERP no disponible (1.5s), usando stock de misión.`, 'warning');
         } finally {
           setIsLiveFetching(false);
         }
@@ -486,7 +492,7 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
 
     // 2. Si se detecta discrepancia, registrar en cola local de destino (Agnóstico)
     const discItem: FloorDiscrepancy = {
-      discrepancyId: crypto.randomUUID ? crypto.randomUUID() : `disc_${Date.now()}`,
+      discrepancyId: generateUUID(),
       taskId: taskIdToUse as any,
       missionId: missionIdToUse,
       skuCode: skuCodeToUse,
@@ -510,67 +516,27 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
       task_id: taskIdToUse,
       deposit_code: originDeposit,
       sku_code: skuCodeToUse,
+      sku_description: skuDescToUse,
       counted_quantity: countedQty,
       system_quantity: finalSystemQty, // ¡Este es el real en vivo que actualiza la base de datos!
       sales_during_audit: 0,
       user_id: user.id,
       target_deposit: targetDeposit,
-      target_system_quantity: targetSysQty
+      target_system_quantity: targetSysQty,
+      discrepancy_id: discItem.discrepancyId
     };
 
-    // 4. Estrategia de Envío asíncrono y Actualización en Supabase
+    // 4. Estrategia de Envío asíncrono y Actualización en Supabase vía Edge Function
     try {
       if (isOnline && isSupabaseConfigured) {
-        // Actualizamos explícitamente en la base de datos de Supabase la nueva cantidad de sistema
-        const { error: dbUpdateErr } = await supabase
-          .from('Read_Mission_Tasks')
-          .update({
-            SystemQuantity: finalSystemQty,
-            CountedQuantity: countedQty,
-            SalesDuringAudit: 0,
-            Discrepancy: discrepancy,
-            Status: taskStatus,
-            UpdatedAt: nowIso
-          })
-          .eq('TaskId', taskIdToUse);
-
-        if (dbUpdateErr) {
-          console.warn('[TabCollector] Error actualizando Read_Mission_Tasks en Supabase:', dbUpdateErr);
-        }
-
-        // Si se generó discrepancia, persistir en Read_Floor_Discrepancies con SkuDescription real
-        if (discrepancy !== 0) {
-          await supabase.from('Read_Floor_Discrepancies').upsert({
-            DiscrepancyId: discItem.discrepancyId,
-            MissionId: missionIdToUse,
-            OriginDeposit: originDeposit,
-            OriginDiscrepancy: discrepancy,
-            SkuCode: skuCodeToUse,
-            SkuDescription: skuDescToUse,
-            Status: 'PENDING_TARGET_COUNT',
-            TargetDeposit: targetDeposit,
-            TargetSystemQuantity: targetSysQty,
-            UpdatedAt: nowIso
-          });
-        } else {
-          // Si el re-conteo concilia el stock a 0 diferencia, cancelar discrepancia pendiente en piso
-          await supabase
-            .from('Read_Floor_Discrepancies')
-            .update({
-              Status: 'CANCELADA',
-              UpdatedAt: nowIso
-            })
-            .eq('MissionId', missionIdToUse)
-            .eq('SkuCode', skuCodeToUse)
-            .or('Status.eq.OPEN,Status.eq.PENDING_TARGET_COUNT,Status.eq.PENDING_FLOOR_COUNT');
-
-          // Actualizar store local de discrepancias reactivamente
+        // Actualizamos localmente el store de discrepancias si fue reconteo cuadrado a 0
+        if (discrepancy === 0) {
           const currentPending = useDiscrepancyStore.getState().pendingFloorDiscrepancies || [];
           const remaining = currentPending.filter((d) => (d.skuCode || '').trim() !== skuCodeToUse.trim());
           useDiscrepancyStore.setState({ pendingFloorDiscrepancies: remaining });
         }
 
-        // Invocamos la Edge Function de Supabase
+        // Invocamos la Edge Function de Supabase (con Service Role para actualizar EventStore, Read_Mission_Tasks y Read_Floor_Discrepancies sin violar RLS)
         const { error: fnErr } = await supabase.functions.invoke('register-count', {
           body: payload,
         });

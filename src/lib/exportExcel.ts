@@ -255,11 +255,12 @@ export async function exportTasksToExcel({
       const theoretical = system - sales;
       const counted = t.CountedQuantity !== null && t.CountedQuantity !== undefined ? Number(t.CountedQuantity) : null;
       const discrepancy = Number(t.Discrepancy ?? 0);
-      const impact = discrepancy * cost;
+      const impact = (t.Status === 'RECONCILED' || (t as any).Status === 'PARTIALLY_RECONCILED')
+        ? 0
+        : discrepancy * cost;
 
       let displayStatus: string = t.Status;
-      if (t.Status === 'RECONCILED') displayStatus = 'TRASLADADO';
-      if (t.Status === 'PARTIALLY_RECONCILED') displayStatus = 'TRASLADO PARCIAL';
+      if (t.Status === 'RECONCILED' || (t as any).Status === 'PARTIALLY_RECONCILED') displayStatus = 'TRASLADADO';
       if (t.Status === 'COMPLETED_MATCH') displayStatus = 'COINCIDENCIA EXACTA';
       if (t.Status === 'PENDING') displayStatus = 'PENDIENTE';
       if (t.Status === 'DISCREPANT') displayStatus = 'DISCREPANCIA';
@@ -378,8 +379,6 @@ export async function exportTasksToExcel({
         } else if (c === 10) {
           const statBg = (displayStatus === 'COINCIDENCIA EXACTA' || displayStatus === 'TRASLADADO')
             ? COLOR_BG_MATCH
-            : displayStatus === 'TRASLADO PARCIAL'
-            ? COLOR_BG_NAVY_LIGHT
             : displayStatus === 'PENDIENTE'
             ? COLOR_LIGHT_BG
             : COLOR_BG_WARNING;
@@ -487,11 +486,12 @@ export async function exportTasksToExcel({
       const theoretical = system - sales;
       const counted = t.CountedQuantity !== null && t.CountedQuantity !== undefined ? Number(t.CountedQuantity) : null;
       const discrepancy = Number(t.Discrepancy ?? 0);
-      const impact = discrepancy * cost;
+      const impact = (t.Status === 'RECONCILED' || (t as any).Status === 'PARTIALLY_RECONCILED')
+        ? 0
+        : discrepancy * cost;
 
       let displayStatus: string = t.Status;
-      if (t.Status === 'RECONCILED') displayStatus = 'TRASLADADO';
-      if (t.Status === 'PARTIALLY_RECONCILED') displayStatus = 'TRASLADO PARCIAL';
+      if (t.Status === 'RECONCILED' || (t as any).Status === 'PARTIALLY_RECONCILED') displayStatus = 'TRASLADADO';
       if (t.Status === 'COMPLETED_MATCH') displayStatus = 'COINCIDENCIA EXACTA';
       if (t.Status === 'PENDING') displayStatus = 'PENDIENTE';
       if (t.Status === 'DISCREPANT') displayStatus = 'DISCREPANCIA';

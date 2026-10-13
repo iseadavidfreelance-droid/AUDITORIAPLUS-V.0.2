@@ -44,6 +44,7 @@ export interface MissionState {
     updatedSystemQty?: number,
     auditorName?: string
   ) => void;
+  reconcileTaskAfterTransfer: (skuCode: string, transferQty?: number) => void;
 
   // Acciones complementarias de control
   setActiveMissionId: (missionId: string | null) => void;
@@ -84,12 +85,13 @@ export function calculateMetricsFromTasks(
       countedSkus++;
       const disc = Number(t.Discrepancy ?? 0);
       const cost = Number(t.Cost ?? 0);
-      totalCostDiscrepancy += disc * cost;
 
       if (t.Status === 'RECONCILED') {
+        // TRASLADADO: La discrepancia fue compensada mediante movimiento entre depósitos
         reconciledSkus++;
       } else if (t.Status === 'DISCREPANT' || disc !== 0) {
         discrepantSkus++;
+        totalCostDiscrepancy += disc * cost;
       } else if (
         t.Status === 'COMPLETED_MATCH' ||
         t.Status === 'COMPLETED' ||
@@ -512,6 +514,54 @@ export const useMissionStore = create<MissionState>((set, get) => ({
 
   setActiveMissionId: (missionId) => set({ activeMissionId: missionId }),
 
+  reconcileTaskAfterTransfer: (skuCode: string, transferQty?: number) => {
+    const trimmed = skuCode.trim();
+    const normalizedSku = normalizeSku(trimmed);
+
+    set((state) => {
+      const nowIso = new Date().toISOString();
+      const updatedTasks = state.tasks.map((task) => {
+        const code = (task.SkuCode || task.skuCode || '').trim();
+        if (code === normalizedSku || code === trimmed) {
+          const origDisc = Number(task.Discrepancy ?? task.discrepancy ?? 0);
+          let newDiscrepancy = 0;
+          if (transferQty !== undefined && transferQty > 0) {
+            if (origDisc < 0) {
+              // Faltante en origen: el traslado hacia el depósito compensa positivamente (e.g. -2 + 2 = 0; -3 + 2 = -1)
+              newDiscrepancy = Math.min(0, Number((origDisc + transferQty).toFixed(2)));
+            } else if (origDisc > 0) {
+              // Sobrante en origen: el traslado saliente compensa negativamente (e.g. +2 - 2 = 0; +3 - 2 = +1)
+              newDiscrepancy = Math.max(0, Number((origDisc - transferQty).toFixed(2)));
+            }
+          }
+
+          return {
+            ...task,
+            Status: 'RECONCILED' as TaskStatus,
+            status: 'RECONCILED' as TaskStatus,
+            Discrepancy: newDiscrepancy,
+            discrepancy: newDiscrepancy,
+            UpdatedAt: nowIso,
+            updatedAt: nowIso,
+          };
+        }
+        return task;
+      });
+
+      const newMetrics = calculateMetricsFromTasks(updatedTasks, state.activeMissionId);
+      return {
+        tasks: updatedTasks,
+        metrics: newMetrics,
+        activeMission: state.activeMission
+          ? {
+              ...state.activeMission,
+              ...newMetrics,
+            }
+          : null,
+      };
+    });
+  },
+
   setActiveMission: (mission) =>
     set((state) => {
       const preserveTaskMetrics = state.tasks.length > 0;
@@ -524,7 +574,17 @@ export const useMissionStore = create<MissionState>((set, get) => ({
         : (currentCalculated?.totalCostDiscrepancy ?? state.metrics.totalCostDiscrepancy ?? 0);
 
       return {
-        activeMission: mission ? { ...mission, totalCostDiscrepancy: safeCost } : null,
+        activeMission: mission
+          ? {
+              ...mission,
+              totalSkus: currentCalculated?.totalSkus ?? mission.totalSkus,
+              pendingSkus: currentCalculated?.pendingSkus ?? mission.pendingSkus,
+              countedSkus: currentCalculated?.countedSkus ?? mission.countedSkus,
+              discrepantSkus: currentCalculated?.discrepantSkus ?? mission.discrepantSkus,
+              reconciledSkus: currentCalculated?.reconciledSkus ?? mission.reconciledSkus,
+              totalCostDiscrepancy: safeCost,
+            }
+          : null,
         activeMissionId: mission?.missionId || null,
         metrics: mission
           ? {

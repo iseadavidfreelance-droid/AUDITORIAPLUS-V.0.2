@@ -44,7 +44,7 @@ Deno.serve(async (req) => {
     const correlationId = crypto.randomUUID();
     const nowIso = new Date().toISOString();
 
-    // 1. CQRS PURO: Escribir Evento Inmutable en EventStore con EventId y Timestamp explícitos
+    // 1. CQRS PURO: Escribir Evento Inmutable en EventStore con EventId y Timestamp explícitos (sin forzar SequenceNum)
     const { error: eventError } = await supabase.from('EventStore').insert({
       EventId: crypto.randomUUID(),
       AggregateId: mission_id,
@@ -60,7 +60,6 @@ Deno.serve(async (req) => {
       Metadata: { source: 'edge_function_confirm_transfer' },
       UserId: userId,
       CorrelationId: correlationId,
-      SequenceNum: Date.now(),
       Timestamp: nowIso,
       Version: 1
     });
@@ -79,13 +78,69 @@ Deno.serve(async (req) => {
       .eq('TransferId', transfer_id);
 
     if (updateError) {
-      console.warn('Advertencia actualizando Read_Virtual_Transfers:', updateError);
+      console.error('Error actualizando Read_Virtual_Transfers:', updateError);
+      return new Response(JSON.stringify({ error: updateError.message, transfer_id }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        status: 500,
+      });
     }
+
+    // 3. Proyección en Read_Floor_Discrepancies: Marcar discrepancia como RESOLVED
+    await supabase
+      .from('Read_Floor_Discrepancies')
+      .update({
+        Status: 'RESOLVED',
+        UpdatedAt: nowIso
+      })
+      .eq('MissionId', mission_id)
+      .eq('SkuCode', sku_code)
+      .or('Status.eq.OPEN,Status.eq.PENDING_TARGET_COUNT,Status.eq.PENDING_FLOOR_COUNT,Status.eq.PENDING_TRANSFER_APPROVAL');
+
+    // Consultar el traslado para obtener TransferQuantity
+    const { data: transferRecord } = await supabase
+      .from('Read_Virtual_Transfers')
+      .select('TransferQuantity, FromDeposit, ToDeposit')
+      .eq('TransferId', transfer_id)
+      .maybeSingle();
+
+    const transferQty = Number(body.transfer_quantity ?? transferRecord?.TransferQuantity ?? 0);
+
+    // Consultar la tarea correspondiente para calcular la nueva diferencia neta
+    const { data: currentTask } = await supabase
+      .from('Read_Mission_Tasks')
+      .select('TaskId, Discrepancy, DepositCode')
+      .eq('MissionId', mission_id)
+      .eq('SkuCode', sku_code)
+      .maybeSingle();
+
+    let adjustedDiscrepancy = 0;
+    if (currentTask) {
+      const origDisc = Number(currentTask.Discrepancy ?? 0);
+      if (origDisc < 0) {
+        // Faltante en origen: el traslado hacia el depósito compensa positivamente (e.g. -2 + 2 = 0; -3 + 2 = -1)
+        adjustedDiscrepancy = Math.min(0, Number((origDisc + transferQty).toFixed(2)));
+      } else if (origDisc > 0) {
+        // Sobrante en origen: el traslado saliente compensa negativamente (e.g. +2 - 2 = 0; +3 - 2 = +1)
+        adjustedDiscrepancy = Math.max(0, Number((origDisc - transferQty).toFixed(2)));
+      }
+    }
+
+    // 4. Proyección en Read_Mission_Tasks: Actualizar Discrepancy ajustada y fijar Status: 'RECONCILED'
+    await supabase
+      .from('Read_Mission_Tasks')
+      .update({
+        Status: 'RECONCILED',
+        Discrepancy: adjustedDiscrepancy,
+        UpdatedAt: nowIso
+      })
+      .eq('MissionId', mission_id)
+      .eq('SkuCode', sku_code);
 
     return new Response(JSON.stringify({
       success: true,
       transfer_id,
-      status: 'COMPLETED'
+      status: 'COMPLETED',
+      adjusted_discrepancy: adjustedDiscrepancy
     }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       status: 200,

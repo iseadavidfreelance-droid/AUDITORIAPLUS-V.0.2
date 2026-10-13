@@ -23,7 +23,7 @@ import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { useMissionStore } from '../store/useMissionStore';
 import { useDiscrepancyStore } from '../stores/useDiscrepancyStore';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
-import { enqueueOfflineEvent } from '../lib/db';
+import { enqueueOfflineEvent, generateUUID } from '../lib/db';
 import { FloorDiscrepancy, VirtualTransfer } from '../types/audit';
 import { useAuthStore } from '../stores/useAuthStore';
 import { formatDepositLabel } from '../lib/deposits';
@@ -259,7 +259,7 @@ export const TabFloorReconciliation: React.FC = () => {
     let virtualTransfer: VirtualTransfer | undefined;
     if (transferQuantity > 0) {
       virtualTransfer = {
-        TransferId: crypto.randomUUID ? crypto.randomUUID() : `trans_${Date.now()}`,
+        TransferId: generateUUID(),
         MissionId: activeMissionId,
         TaskId: selectedDiscrepancy.taskId || matchingTask?.TaskId || '',
         SkuCode: skuCode,
@@ -292,41 +292,12 @@ export const TabFloorReconciliation: React.FC = () => {
 
     try {
       if (isOnline && isSupabaseConfigured) {
-        // 1. Actualización directa de la tabla Read_Floor_Discrepancies garantizando persistencia del TargetSystemQuantity y SkuDescription
-        await supabase
-          .from('Read_Floor_Discrepancies')
-          .update({
-            SkuDescription: realSkuDesc,
-            TargetSystemQuantity: floorSystem,
-            TargetCountedQuantity: floorCounted,
-            TargetDiscrepancy: targetDiscrepancyVal,
-            Status: transferQuantity > 0 ? 'PENDING_TRANSFER_APPROVAL' : 'RESOLVED',
-            UpdatedAt: new Date().toISOString(),
-          })
-          .eq('DiscrepancyId', discId);
-
-        // 2. Si hay traslado sugerido, persistirlo de inmediato en Read_Virtual_Transfers según el esquema oficial en /docs
-        if (transferQuantity > 0 && virtualTransfer) {
-          await supabase
-            .from('Read_Virtual_Transfers')
-            .upsert({
-              TransferId: virtualTransfer.TransferId,
-              MissionId: activeMissionId,
-              SkuCode: skuCode,
-              SkuDescription: realSkuDesc,
-              FromDeposit: selectedDiscrepancy.originDeposit || '150101',
-              ToDeposit: selectedDiscrepancy.targetDeposit || '150103',
-              TransitDeposit: '150104',
-              TransferQuantity: transferQuantity,
-              Status: 'SUGGESTED',
-              CreatedAt: new Date().toISOString(),
-              UpdatedAt: new Date().toISOString(),
-            });
-        }
-
-        const { error } = await supabase.functions.invoke('register-floor-count', { body: payload });
-        if (error) {
-          console.warn('[TabFloorReconciliation] Edge function retornó advertencia:', error);
+        // Invocación autorizada de register-floor-count con Service Role (actualiza EventStore, Read_Floor_Discrepancies y Read_Virtual_Transfers sin violar RLS)
+        const { data: fnData, error: fnErr } = await supabase.functions.invoke('register-floor-count', { body: payload });
+        if (fnErr) {
+          console.warn('[TabFloorReconciliation] Edge function retornó advertencia:', fnErr);
+        } else if (fnData?.transfer_id && virtualTransfer) {
+          virtualTransfer.TransferId = fnData.transfer_id;
         }
       } else {
         await enqueueOfflineEvent({
@@ -381,16 +352,11 @@ export const TabFloorReconciliation: React.FC = () => {
           })
           .eq('DiscrepancyId', discId);
 
-        if (updateErr) throw updateErr;
+        if (updateErr) {
+          console.warn('[TabFloorReconciliation] Advertencia al marcar CANCELADA en Read_Floor_Discrepancies:', updateErr);
+        }
 
-        // 2. Insertar evento explícito en EventStore
-        const generateUUID = () => {
-          return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-            const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
-            return v.toString(16);
-          });
-        };
-
+        // 2. Insertar evento explícito en EventStore (sin SequenceNum forzado)
         await supabase.from('EventStore').insert({
           EventId: generateUUID(),
           EventType: 'DiscrepancyCancelled',
@@ -408,7 +374,6 @@ export const TabFloorReconciliation: React.FC = () => {
             source: 'TabFloorReconciliation',
             auditor: user?.email?.split('@')[0] || 'Auditor'
           },
-          SequenceNum: 1,
           Timestamp: nowIso,
           Version: 1
         });
@@ -440,11 +405,12 @@ export const TabFloorReconciliation: React.FC = () => {
     const transferIdToConfirm = transfer.TransferId || transfer.transferId;
     const missionId = transfer.MissionId || transfer.missionId;
     const skuCode = transfer.SkuCode || transfer.skuCode;
+    const nowIso = new Date().toISOString();
     
     setIsSubmitting(true);
 
     try {
-      // 1. Actualización Optimista Visual Inmediata
+      // 1. Actualización Optimista Visual Inmediata de Traslados
       setVirtualTransfers(
         virtualTransfers.map((t) =>
           (t.TransferId || (t as any).transferId) === transferIdToConfirm
@@ -453,23 +419,24 @@ export const TabFloorReconciliation: React.FC = () => {
         )
       );
 
-      // 2. Persistencia Incondicional en Read_Virtual_Transfers de Supabase
+      // 2. Conciliación Inmediata en Memoria: Tarea pasa a RECONCILED (mostrado como TRASLADADO) y ajusta Discrepancy
+      if (skuCode) {
+        useMissionStore.getState().reconcileTaskAfterTransfer(skuCode, transferQty);
+        const remainingDiscs = pendingFloorDiscrepancies.filter(
+          (d) => (d.skuCode || '').trim() !== (skuCode || '').trim()
+        );
+        setPendingDiscrepancies(remainingDiscs);
+      }
+
+      // 3. Persistencia en Base de Datos de Supabase
       if (isOnline && isSupabaseConfigured) {
-        const { error: dbError } = await supabase
-          .from('Read_Virtual_Transfers')
-          .update({ Status: 'COMPLETED', UpdatedAt: new Date().toISOString() })
-          .eq('TransferId', transferIdToConfirm);
-
-        if (dbError) {
-          console.warn('[TabFloorReconciliation] Advertencia al actualizar Read_Virtual_Transfers:', dbError);
-        }
-
-        // 3. Invocar Edge Function confirm-transfer para registrar evento y mantener CQRS
+        // Invocar Edge Function confirm-transfer con Service Role (actualiza EventStore, Read_Virtual_Transfers, Read_Floor_Discrepancies y Read_Mission_Tasks con Discrepancy ajustada)
         const { error: fnErr } = await supabase.functions.invoke('confirm-transfer', {
           body: {
             transfer_id: transferIdToConfirm,
             mission_id: missionId,
             sku_code: skuCode,
+            transfer_quantity: transferQty,
             user_id: user?.id
           }
         });
@@ -479,13 +446,13 @@ export const TabFloorReconciliation: React.FC = () => {
         }
       }
 
-      showToast('Traslado confirmado exitosamente en el ERP.', 'success');
+      showToast(`Traslado de ${transferQty} u confirmado exitosamente en el ERP. Tarea marcada como TRASLADADA.`, 'success');
 
       // 4. Refrescar vistas para sincronizar la matemática en Reportes
       setTimeout(async () => {
         await fetchOpenDiscrepancies();
         if (activeMissionId) fetchMissionTasks(activeMissionId);
-      }, 600);
+      }, 500);
       
     } catch (err) {
       console.error('Error aprobando traslado:', err);

@@ -64,8 +64,11 @@ Deno.serve(async (req) => {
     const targetSys = Number(finalSystemQty);
     const targetDiscrepancy = targetCount - targetSys;
 
+    const nowIso = new Date().toISOString();
+
     // 1. Escribir Evento FloorCountRegistered en EventStore (Respetando tu AggregateType)
     const { error: eventError } = await supabase.from('EventStore').insert({
+      EventId: crypto.randomUUID(),
       AggregateId: mission_id,
       AggregateType: 'Mission',
       EventType: 'FloorCountRegistered',
@@ -81,7 +84,9 @@ Deno.serve(async (req) => {
       },
       Metadata: { source: 'edge_function_register_floor_count_v2' },
       UserId: userId,
-      CorrelationId: correlationId
+      CorrelationId: correlationId,
+      Timestamp: nowIso,
+      Version: 1
     });
 
     if (eventError) throw new Error("Fallo al registrar evento de conteo: " + eventError.message);
@@ -106,10 +111,14 @@ Deno.serve(async (req) => {
       toDep = target_deposit || '150103';
     }
 
+    let createdTransferId: string | null = null;
+
     if (transferQty > 0) {
       const newTransferId = crypto.randomUUID();
+      createdTransferId = newTransferId;
       
       await supabase.from('EventStore').insert({
+        EventId: crypto.randomUUID(),
         AggregateId: mission_id,
         AggregateType: 'Mission',
         EventType: 'VirtualTransferCreated',
@@ -126,19 +135,61 @@ Deno.serve(async (req) => {
         },
         Metadata: { source: 'edge_function_register_floor_count_v2' },
         UserId: userId,
-        CorrelationId: correlationId
+        CorrelationId: correlationId,
+        Timestamp: nowIso,
+        Version: 1
       });
+
+      // Proyección autorizada en Read_Virtual_Transfers usando Service Role
+      const { error: transferProjErr } = await supabase
+        .from('Read_Virtual_Transfers')
+        .upsert({
+          TransferId: newTransferId,
+          MissionId: mission_id,
+          SkuCode: sku_code,
+          SkuDescription: sku_description || '',
+          FromDeposit: fromDep,
+          ToDeposit: toDep,
+          TransitDeposit: '150104',
+          TransferQuantity: transferQty,
+          Status: 'SUGGESTED',
+          CreatedAt: nowIso,
+          UpdatedAt: nowIso
+        });
+
+      if (transferProjErr) {
+        console.warn('Advertencia al insertar en Read_Virtual_Transfers:', transferProjErr);
+      }
 
       transferExecuted = true;
     }
 
-    // Respuesta HTTP idéntica a la tuya para no romper el Frontend
+    // 3. Proyección autorizada en Read_Floor_Discrepancies usando Service Role
+    const floorStatus = transferQty > 0 ? 'PENDING_TRANSFER_APPROVAL' : 'RESOLVED';
+    const { error: updateDiscErr } = await supabase
+      .from('Read_Floor_Discrepancies')
+      .update({
+        SkuDescription: sku_description || '',
+        TargetSystemQuantity: targetSys,
+        TargetCountedQuantity: targetCount,
+        TargetDiscrepancy: targetDiscrepancy,
+        Status: floorStatus,
+        UpdatedAt: nowIso
+      })
+      .eq('DiscrepancyId', discrepancy_id);
+
+    if (updateDiscErr) {
+      console.warn('Advertencia actualizando Read_Floor_Discrepancies:', updateDiscErr);
+    }
+
+    // Respuesta HTTP idéntica con transfer_id incluido
     return new Response(JSON.stringify({
       success: true,
       discrepancy_id,
       floor_discrepancy: targetDiscrepancy,
       virtual_transfer_executed: transferExecuted,
-      transfer_quantity: transferQty
+      transfer_quantity: transferQty,
+      transfer_id: createdTransferId
     }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       status: 200,

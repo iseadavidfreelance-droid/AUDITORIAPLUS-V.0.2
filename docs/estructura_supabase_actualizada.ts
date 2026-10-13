@@ -367,7 +367,91 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
-      [_ in never]: never
+      "confirm-transfer": {
+        Args: {
+          transfer_id: string
+          mission_id: string
+          sku_code: string
+          user_id?: string
+        }
+        Returns: {
+          success: boolean
+          transfer_id: string
+          status: 'COMPLETED'
+        }
+      }
+      "register-count": {
+        Args: {
+          mission_id: string
+          task_id: string
+          deposit_code: string
+          sku_code: string
+          counted_quantity: number
+          system_quantity: number
+          sales_during_audit?: number
+          user_id?: string
+          target_deposit?: string
+          target_system_quantity?: number
+        }
+        Returns: {
+          status: string
+          code: number
+          data: {
+            task_id: string
+            calculated_discrepancy: number
+            status: 'COMPLETED_MATCH' | 'DISCREPANT'
+          }
+        }
+      }
+      "register-floor-count": {
+        Args: {
+          discrepancy_id: string
+          mission_id: string
+          sku_code: string
+          sku_description?: string
+          origin_deposit: string
+          target_deposit: string
+          warehouse_discrepancy: number
+          origin_discrepancy: number
+          floor_counted_qty: number
+          target_counted_quantity: number
+          floor_system_qty: number
+          target_system_quantity: number
+          sales_during_audit?: number
+          user_id?: string
+        }
+        Returns: {
+          status: string
+          code: number
+          data: {
+            discrepancy_id: string
+            transfer_suggested: boolean
+            transfer_id?: string
+            transferred_qty?: number
+          }
+        }
+      }
+      "ingest-excel": {
+        Args: {
+          deposit_code: string
+          user_id?: string
+          excel_hash?: string
+          file_name?: string
+        }
+        Returns: {
+          status: string
+          mission_id: string
+          total_skus: number
+        }
+      }
+      "reports-pdf": {
+        Args: {
+          mission_id: string
+          filtered_tasks?: Json
+          metrics?: Json
+        }
+        Returns: Json
+      }
     }
     Enums: {
       [_ in never]: never
@@ -502,4 +586,119 @@ export const Constants = {
   public: {
     Enums: {},
   },
-} as const
+} as const;
+
+// ============================================================================
+// CONTRATOS Y ESQUEMAS DE LAS SUPABASE EDGE FUNCTIONS (v.0.4 PRIME)
+// ============================================================================
+
+export interface ConfirmTransferArgs {
+  transfer_id: string;
+  mission_id: string;
+  sku_code: string;
+  transfer_quantity?: number;
+  user_id?: string;
+}
+
+export interface ConfirmTransferResponse {
+  success: boolean;
+  transfer_id: string;
+  status: 'COMPLETED';
+  adjusted_discrepancy?: number;
+}
+
+export interface RegisterCountArgs {
+  mission_id: string;
+  task_id: string;
+  deposit_code: string;
+  sku_code: string;
+  sku_description?: string;
+  counted_quantity: number;
+  system_quantity: number;
+  sales_during_audit?: number;
+  user_id?: string;
+  target_deposit?: string;
+  target_system_quantity?: number;
+  discrepancy_id?: string;
+}
+
+export interface RegisterCountResponse {
+  status: 'success' | 'error';
+  code: number;
+  data: {
+    task_id: string;
+    calculated_discrepancy: number;
+    status: 'COMPLETED_MATCH' | 'DISCREPANT';
+    discrepancy_id?: string | null;
+  };
+}
+
+export interface RegisterFloorCountArgs {
+  discrepancy_id: string;
+  mission_id: string;
+  sku_code: string;
+  sku_description?: string;
+  origin_deposit: string;
+  target_deposit: string;
+  warehouse_discrepancy: number;
+  origin_discrepancy: number;
+  floor_counted_qty: number;
+  target_counted_quantity: number;
+  floor_system_qty: number;
+  target_system_quantity: number;
+  sales_during_audit?: number;
+  user_id?: string;
+}
+
+export interface RegisterFloorCountResponse {
+  status: 'success' | 'error';
+  code: number;
+  data: {
+    discrepancy_id: string;
+    transfer_suggested: boolean;
+    transfer_id?: string;
+    transferred_qty?: number;
+  };
+}
+
+export interface IngestExcelArgs {
+  deposit_code: string;
+  user_id?: string;
+  excel_hash?: string;
+  file_name?: string;
+}
+
+export interface ReportsPdfArgs {
+  mission_id: string;
+  filtered_tasks?: Json;
+  metrics?: Json;
+}
+
+// ============================================================================
+// ESQUEMA DE EVENTOS INMUTABLES CQRS (EventStore)
+// ============================================================================
+
+export type DomainEventType =
+  | 'MissionCreated'
+  | 'TaskCountRegistered'
+  | 'DiscrepancyDetected'
+  | 'DiscrepancyCancelled'
+  | 'FloorCountRegistered'
+  | 'VirtualTransferCreated'
+  | 'VirtualTransferExecuted';
+
+export interface EventStoreEntity<TPayload = Json> {
+  EventId: string;
+  AggregateId: string;
+  AggregateType: 'Mission' | 'MissionTask' | 'CrossDiscrepancy' | 'FloorDiscrepancy' | 'VirtualTransfer';
+  EventType: DomainEventType;
+  UserId: string;
+  CorrelationId: string;
+  CausationId?: string | null;
+  SequenceNum: number;
+  Timestamp: string;
+  Version: number;
+  Payload: TPayload;
+  Metadata: Json;
+}
+
