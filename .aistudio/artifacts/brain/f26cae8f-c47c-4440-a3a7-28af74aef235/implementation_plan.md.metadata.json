@@ -1,6 +1,6 @@
 {
-  "summary":  "Plan de implementación para protección contra doble conteo con tarjeta fija informativa de auditor previo y re-conteo asistido, corrección del nombre real de producto en discrepancias de piso (destino), eliminación del flujo de ventas durante auditoría, y validación estricta del esquema Supabase en /docs.",
-  "updatedAt":  "2026-10-12T11:23:51.629010882Z",
-  "requestFeedback":  true,
-  "userFacing":  true
+  "summary": "Plan detallado para optimización de escaneo automático en colectores Android, cancelación y borrado de falsas discrepancias con persistencia CQRS, teclado de conteo rápido centrado en cantidad ERP (-2, -1, ERP, +1, +2), modal estilizado para confirmación de traslados, y nombres descriptivos de depósitos (ALMACÉN 150101 y PISO DE VENTAS 150103).",
+  "updatedAt": "2026-10-13T16:48:30.942365177Z",
+  "requestFeedback": true,
+  "userFacing": true
 }

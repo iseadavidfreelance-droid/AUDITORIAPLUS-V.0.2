@@ -39,6 +39,7 @@ import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { enqueueOfflineEvent } from '../lib/db';
 import { normalizeSku, FloorDiscrepancy } from '../types/audit';
 import { useAuthStore } from '../stores/useAuthStore';
+import { formatDepositLabel } from '../lib/deposits';
 import {
   getAuditorName,
   getTaskAuditRecord,
@@ -112,6 +113,7 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
   const html5QrCodeRef = useRef<Html5Qrcode | null>(null);
   const lastScanTimeRef = useRef<number>(0);
   const lastScannedCodeRef = useRef<string>('');
+  const scanDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // VARIABLES DE ESTADÍSTICAS EN VIVO
   const totalSkus = activeMission?.totalSkus || 0;
@@ -122,6 +124,11 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
 
   useEffect(() => {
     scannerInputRef.current?.focus();
+    return () => {
+      if (scanDebounceTimerRef.current) {
+        clearTimeout(scanDebounceTimerRef.current);
+      }
+    };
   }, []);
 
   const applyLpadNormalization = (raw: string): string => {
@@ -176,13 +183,19 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
               // 2. Buscar las existencias físicas para ambos
               const originItem = json.data.find((d: any) => d.codigo_deposito === originDep);
               const targetItem = json.data.find((d: any) => d.codigo_deposito === targetDep);
+              const liveOriginStock = originItem ? Number(originItem.stock_quantity) : 0;
 
               // 3. Inyectar datos frescos en el estado
               setLiveData({
-                systemQty: originItem ? Number(originItem.stock_quantity) : 0,
+                systemQty: liveOriginStock,
                 targetQty: targetItem ? Number(targetItem.stock_quantity) : 0,
                 targetDeposit: targetDep
               });
+
+              // Si el SKU no tiene conteo registrado previo, pre-escribir la cantidad del ERP
+              if (task.CountedQuantity === null || task.CountedQuantity === undefined) {
+                setCountedInput(String(liveOriginStock));
+              }
               
               showToastBanner(`SKU ${task.SkuCode || task.skuCode} escaneado. Stock ERP actualizado en vivo.`, 'success');
             }
@@ -322,8 +335,11 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
         : '';
 
       const isCounted = activeTask.CountedQuantity !== null && activeTask.CountedQuantity !== undefined;
+      const initialCount = isCounted
+        ? existingCount
+        : String(Number(activeTask.SystemQuantity ?? activeTask.systemQuantity ?? 0));
 
-      setCountedInput(existingCount);
+      setCountedInput(initialCount);
       setManualSystemQty(null);
       setIsEditingSystemQty(false);
       setTempSystemQtyInput('');
@@ -372,7 +388,45 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
 
   const handleBarcodeSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    processDetectedCode(searchTerm, 'manual');
+    if (scanDebounceTimerRef.current) {
+      clearTimeout(scanDebounceTimerRef.current);
+    }
+    if (searchTerm.trim()) {
+      processDetectedCode(searchTerm.trim(), 'manual');
+    }
+  };
+
+  const handleSearchInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = e.target.value;
+    setSearchTerm(val);
+
+    if (scanDebounceTimerRef.current) {
+      clearTimeout(scanDebounceTimerRef.current);
+    }
+
+    const trimmed = val.trim();
+    // Detección automática en colectores Android y escaneo continuo
+    if (trimmed.length >= 3) {
+      scanDebounceTimerRef.current = setTimeout(() => {
+        const currentActiveSku = (activeTask?.SkuCode || activeTask?.skuCode || '').trim();
+        const normalized = applyLpadNormalization(trimmed);
+        if (currentActiveSku !== normalized && currentActiveSku !== trimmed) {
+          processDetectedCode(trimmed, 'manual');
+        }
+      }, 280);
+    }
+  };
+
+  const handleSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (scanDebounceTimerRef.current) {
+        clearTimeout(scanDebounceTimerRef.current);
+      }
+      if (searchTerm.trim()) {
+        processDetectedCode(searchTerm.trim(), 'manual');
+      }
+    }
   };
 
   const adjustCount = (delta: number) => {
@@ -530,6 +584,47 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
             TargetSystemQuantity: targetSysQty,
             UpdatedAt: nowIso
           });
+        } else {
+          // Si el re-conteo concilia el stock a 0 diferencia, cancelar discrepancia pendiente en piso
+          await supabase
+            .from('Read_Floor_Discrepancies')
+            .update({
+              Status: 'CANCELADA',
+              ResolvedAt: nowIso,
+              UpdatedAt: nowIso
+            })
+            .eq('MissionId', missionIdToUse)
+            .eq('SkuCode', skuCodeToUse)
+            .or('Status.eq.OPEN,Status.eq.PENDING_TARGET_COUNT,Status.eq.PENDING_FLOOR_COUNT');
+
+          // Registrar evento explícito en EventStore
+          await supabase.from('EventStore').insert({
+            EventId: generateUUID(),
+            EventType: 'DiscrepancyCancelled',
+            AggregateId: taskIdToUse,
+            AggregateType: 'FloorDiscrepancy',
+            UserId: user.id,
+            CorrelationId: generateUUID(),
+            Payload: {
+              sku_code: skuCodeToUse,
+              mission_id: missionIdToUse,
+              reason: 'RECOUNT_CONCILIATED_ZERO_DISCREPANCY',
+              counted_quantity: countedQty,
+              system_quantity: finalSystemQty
+            },
+            Metadata: {
+              source: 'TabCollector',
+              auditor_name: auditorName
+            },
+            SequenceNum: 1,
+            Timestamp: nowIso,
+            Version: 1
+          });
+
+          // Actualizar store local de discrepancias reactivamente
+          const currentPending = useDiscrepancyStore.getState().pendingFloorDiscrepancies || [];
+          const remaining = currentPending.filter((d) => (d.skuCode || '').trim() !== skuCodeToUse.trim());
+          useDiscrepancyStore.setState({ pendingFloorDiscrepancies: remaining });
         }
 
         // Invocamos la Edge Function de Supabase
@@ -563,7 +658,7 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
         showToastBanner(`Conteo exacto registrado (${countedQty} u)`, 'success');
       } else {
         showToastBanner(
-          `Discrepancia detectada (${discrepancy > 0 ? `+${discrepancy}` : discrepancy} u). Pasó a validación en Dep. ${targetDeposit}`,
+          `Discrepancia detectada (${discrepancy > 0 ? `+${discrepancy}` : discrepancy} u). Pasó a validación en ${formatDepositLabel(targetDeposit)}`,
           'warning',
           discrepancy
         );
@@ -767,7 +862,8 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
               autoComplete="off"
               autoFocus
               value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
+              onChange={handleSearchInputChange}
+              onKeyDown={handleSearchKeyDown}
               placeholder="Escanear o ingresar SKU manual..."
               className="w-full h-14 pl-11 pr-10 bg-white border-2 border-[#E5E7EB] focus:border-[#009045] rounded-[8px] text-[#1F2937] font-mono text-lg font-bold placeholder:text-[#6B7280] focus:outline-hidden"
             />
@@ -817,11 +913,11 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
                   SKU: {activeTask.SkuCode || activeTask.skuCode}
                 </span>
                 <span className="text-xs font-semibold text-[#6B7280]">
-                  Dep. Origen: {activeTask.DepositCode || activeTask.depositCode || '150101'}
+                  Origen: {formatDepositLabel(activeTask.DepositCode || activeTask.depositCode || '150101')}
                 </span>
                 {liveData.targetDeposit && (
                   <span className="text-xs font-semibold text-[#F59E0B]">
-                    Dep. Destino: {liveData.targetDeposit}
+                    Destino: {formatDepositLabel(liveData.targetDeposit)}
                   </span>
                 )}
                 <span className="text-xs font-semibold text-[#009045]">
@@ -1113,57 +1209,67 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
                   />
                 </div>
 
-                {/* Teclado de Incrementos Rápidos Táctiles */}
-                <div className="grid grid-cols-6 gap-2 pt-1">
-                  <button
-                    type="button"
-                    onClick={() => adjustCount(1)}
-                    disabled={isLiveFetching}
-                    className="btn-collector bg-white hover:bg-[#F8F9FA] border border-[#E5E7EB] disabled:opacity-50 text-[#1F2937] min-h-[48px] rounded-[8px] font-black text-base active:scale-95"
-                  >
-                    +1
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => adjustCount(5)}
-                    disabled={isLiveFetching}
-                    className="btn-collector bg-white hover:bg-[#F8F9FA] border border-[#E5E7EB] disabled:opacity-50 text-[#1F2937] min-h-[48px] rounded-[8px] font-black text-base active:scale-95"
-                  >
-                    +5
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => adjustCount(10)}
-                    disabled={isLiveFetching}
-                    className="btn-collector bg-white hover:bg-[#F8F9FA] border border-[#E5E7EB] disabled:opacity-50 text-[#1F2937] min-h-[48px] rounded-[8px] font-black text-base active:scale-95"
-                  >
-                    +10
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => adjustCount(25)}
-                    disabled={isLiveFetching}
-                    className="btn-collector bg-white hover:bg-[#F8F9FA] border border-[#E5E7EB] disabled:opacity-50 text-[#1F2937] min-h-[48px] rounded-[8px] font-black text-base active:scale-95"
-                  >
-                    +25
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => adjustCount(-1)}
-                    disabled={isLiveFetching}
-                    className="btn-collector bg-white hover:bg-[#F8F9FA] border border-[#E5E7EB] disabled:opacity-50 text-[#1F2937] min-h-[48px] rounded-[8px] font-black text-base active:scale-95"
-                  >
-                    -1
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setCountedInput('')}
-                    disabled={isLiveFetching}
-                    className="btn-collector bg-red-50 hover:bg-red-100 disabled:opacity-50 border border-red-200 text-[#DC2626] min-h-[48px] rounded-[8px] font-bold flex items-center justify-center text-xs active:scale-95"
-                  >
-                    <RotateCcw className="w-4 h-4" />
-                  </button>
-                </div>
+                {/* Teclado Inteligente Centrado en la Cantidad del ERP */}
+                {(() => {
+                  const baseQty = Math.round(finalSystemQty);
+                  const suggestedOptions = [
+                    { val: Math.max(0, baseQty - 2), diff: '-2' },
+                    { val: Math.max(0, baseQty - 1), diff: '-1' },
+                    { val: baseQty, diff: 'ERP', isExact: true },
+                    { val: baseQty + 1, diff: '+1' },
+                    { val: baseQty + 2, diff: '+2' },
+                  ];
+
+                  return (
+                    <div className="space-y-1.5 pt-1">
+                      <div className="flex items-center justify-between text-[11px] text-[#6B7280] font-semibold">
+                        <span>Cantidades sugeridas rápidas (Centradas en ERP {baseQty} u):</span>
+                        <span className="hidden sm:inline">Toque para seleccionar</span>
+                      </div>
+                      <div className="grid grid-cols-6 gap-2">
+                        {suggestedOptions.map((opt, idx) => {
+                          const isSelected = countedInput === String(opt.val);
+                          return (
+                            <button
+                              key={idx}
+                              type="button"
+                              onClick={() => setCountedInput(String(opt.val))}
+                              disabled={isLiveFetching}
+                              className={`btn-collector border disabled:opacity-50 min-h-[50px] rounded-[8px] flex flex-col items-center justify-center transition active:scale-95 ${
+                                opt.isExact
+                                  ? isSelected
+                                    ? 'bg-[#009045] text-white border-[#009045] shadow-xs'
+                                    : 'bg-emerald-50 text-[#009045] border-[#009045]/40 hover:bg-emerald-100 font-bold'
+                                  : isSelected
+                                  ? 'bg-[#263988] text-white border-[#263988] shadow-xs'
+                                  : 'bg-white hover:bg-[#F8F9FA] border-[#E5E7EB] text-[#1F2937]'
+                              }`}
+                            >
+                              <span className="font-mono font-black text-lg sm:text-xl leading-none">{opt.val}</span>
+                              <span className="text-[9px] font-bold uppercase mt-1 leading-none opacity-80">
+                                {opt.isExact ? 'Exacto' : opt.diff}
+                              </span>
+                            </button>
+                          );
+                        })}
+                        <button
+                          type="button"
+                          onClick={() => setCountedInput('0')}
+                          disabled={isLiveFetching}
+                          className={`btn-collector border disabled:opacity-50 min-h-[50px] rounded-[8px] flex flex-col items-center justify-center transition active:scale-95 ${
+                            countedInput === '0'
+                              ? 'bg-[#DC2626] text-white border-[#DC2626] shadow-xs'
+                              : 'bg-red-50 hover:bg-red-100 text-[#DC2626] border-red-200'
+                          }`}
+                          title="Faltante total (0 existencias)"
+                        >
+                          <span className="font-mono font-black text-lg sm:text-xl leading-none">0</span>
+                          <span className="text-[9px] font-bold uppercase mt-1 leading-none">Cero</span>
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
 
               {/* Banner de Previsualización Dinámica del Resultado */}

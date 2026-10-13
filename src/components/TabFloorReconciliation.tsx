@@ -16,7 +16,8 @@ import {
   X,
   ArrowRightLeft,
   Edit2,
-  Check
+  Check,
+  Trash2
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { useMissionStore } from '../store/useMissionStore';
@@ -25,6 +26,7 @@ import { useOnlineStatus } from '../hooks/useOnlineStatus';
 import { enqueueOfflineEvent } from '../lib/db';
 import { FloorDiscrepancy, VirtualTransfer } from '../types/audit';
 import { useAuthStore } from '../stores/useAuthStore';
+import { formatDepositLabel } from '../lib/deposits';
 
 export const TabFloorReconciliation: React.FC = () => {
   const isOnline = useOnlineStatus();
@@ -53,6 +55,10 @@ export const TabFloorReconciliation: React.FC = () => {
 
   const [filterQuery, setFilterQuery] = useState<string>('');
   const [toast, setToast] = useState<{ text: string; type: 'success' | 'warning' | 'error' } | null>(null);
+
+  // Estados para modales estilizados
+  const [discrepancyToCancel, setDiscrepancyToCancel] = useState<FloorDiscrepancy | null>(null);
+  const [transferToConfirm, setTransferToConfirm] = useState<any | null>(null);
 
   // Carga paralela: Discrepancias Pendientes + Todos los Traslados
   const fetchOpenDiscrepancies = useCallback(async () => {
@@ -356,19 +362,82 @@ export const TabFloorReconciliation: React.FC = () => {
     }
   };
 
-  // --- CONFIRMACIÓN HUMANA DEL TRASLADO (VÍA EVENTSTORE DIRECTO) ---
-  const handleApproveTransfer = async (transfer: any) => {
+  // --- CANCELACIÓN MANUAL DE DISCREPANCIA FALSA (ESTADO CANCELADA) ---
+  const handleConfirmCancelDiscrepancy = async () => {
+    if (!discrepancyToCancel) return;
+    const disc = discrepancyToCancel;
+    setIsSubmitting(true);
+    const nowIso = new Date().toISOString();
+    const discId = disc.discrepancyId;
+
+    try {
+      if (isOnline && isSupabaseConfigured) {
+        // 1. Marcar como CANCELADA en Read_Floor_Discrepancies
+        const { error: updateErr } = await supabase
+          .from('Read_Floor_Discrepancies')
+          .update({
+            Status: 'CANCELADA',
+            ResolvedAt: nowIso,
+            UpdatedAt: nowIso
+          })
+          .eq('DiscrepancyId', discId);
+
+        if (updateErr) throw updateErr;
+
+        // 2. Insertar evento explícito en EventStore
+        const generateUUID = () => {
+          return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+            const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+          });
+        };
+
+        await supabase.from('EventStore').insert({
+          EventId: generateUUID(),
+          EventType: 'DiscrepancyCancelled',
+          AggregateId: disc.taskId || discId,
+          AggregateType: 'FloorDiscrepancy',
+          UserId: user?.id || '00000000-0000-0000-0000-000000000000',
+          CorrelationId: generateUUID(),
+          Payload: {
+            discrepancy_id: discId,
+            sku_code: disc.skuCode,
+            mission_id: disc.missionId,
+            reason: 'MANUAL_DISCARD_BY_AUDITOR'
+          },
+          Metadata: {
+            source: 'TabFloorReconciliation',
+            auditor: user?.email?.split('@')[0] || 'Auditor'
+          },
+          SequenceNum: 1,
+          Timestamp: nowIso,
+          Version: 1
+        });
+      }
+
+      // 3. Remover de estados locales reactivamente
+      const remaining = pendingFloorDiscrepancies.filter((d) => d.discrepancyId !== discId);
+      setPendingDiscrepancies(remaining);
+
+      if (selectedDiscrepancy?.discrepancyId === discId) {
+        setSelectedDiscrepancy(null);
+      }
+
+      showToast(`Discrepancia para SKU ${disc.skuCode} cancelada exitosamente.`, 'success');
+    } catch (err) {
+      console.error('Error al cancelar discrepancia:', err);
+      showToast('Error al descartar la discrepancia en base de datos', 'error');
+    } finally {
+      setIsSubmitting(false);
+      setDiscrepancyToCancel(null);
+    }
+  };
+
+  // --- CONFIRMACIÓN HUMANA DEL TRASLADO (VÍA MODAL ESTILIZADO) ---
+  const handleExecuteTransferConfirm = async () => {
+    if (!transferToConfirm) return;
+    const transfer = transferToConfirm;
     const transferQty = transfer.TransferQuantity || transfer.TransferredQuantity || 0;
-    const isConfirmed = window.confirm(
-      `¿ESTÁS SEGURO QUE ESTE TRASLADO SE REALIZÓ EN EL ERP?\n\nSKU: ${
-        transfer.SkuCode || transfer.skuCode
-      }\nCantidad: ${transferQty} u\nDe: ${transfer.FromDeposit || transfer.OriginDeposit} -> A: ${
-        transfer.ToDeposit || transfer.DestinationDeposit
-      }`
-    );
-
-    if (!isConfirmed) return;
-
     const transferIdToConfirm = transfer.TransferId || transfer.transferId;
     const missionId = transfer.MissionId || transfer.missionId;
     const skuCode = transfer.SkuCode || transfer.skuCode;
@@ -400,9 +469,9 @@ export const TabFloorReconciliation: React.FC = () => {
         AggregateId: transferIdToConfirm,
         AggregateType: 'VirtualTransfer',
         UserId: user?.id || '00000000-0000-0000-0000-000000000000',
-        CorrelationId: generateUUID(), // CAMPO OBLIGATORIO PARA SUPERAR RESTRICCIÓN
-        Version: 1, // CAMPO OBLIGATORIO
-        Metadata: { appVersion: '1.0.0', source: 'TabFloorReconciliation' }, // CAMPO OBLIGATORIO
+        CorrelationId: generateUUID(),
+        Version: 1,
+        Metadata: { appVersion: '1.0.0', source: 'TabFloorReconciliation' },
         Payload: {
           transfer_id: transferIdToConfirm,
           mission_id: missionId,
@@ -416,7 +485,6 @@ export const TabFloorReconciliation: React.FC = () => {
 
       if (eventError) {
         console.error('Error insertando en EventStore:', eventError);
-        // Fallback secundario directo a la tabla si el EventStore tuviera RLS activado
         const { error: dbError } = await supabase
           .from('Read_Virtual_Transfers')
           .update({ Status: 'COMPLETED', UpdatedAt: new Date().toISOString() })
@@ -436,9 +504,10 @@ export const TabFloorReconciliation: React.FC = () => {
     } catch (err) {
       console.error('Error aprobando traslado:', err);
       showToast('Error al confirmar el traslado. Revisa la consola.', 'error');
-      await fetchOpenDiscrepancies(); // Rollback visual si algo falló
+      await fetchOpenDiscrepancies();
     } finally {
       setIsSubmitting(false);
+      setTransferToConfirm(null);
     }
   };
 
@@ -539,7 +608,7 @@ export const TabFloorReconciliation: React.FC = () => {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-bold text-[#1F2937] mb-1.5 uppercase tracking-wider">
-                CONTADO EN DESTINO ({selectedDiscrepancy.targetDeposit}):
+                CONTADO EN DESTINO ({formatDepositLabel(selectedDiscrepancy.targetDeposit)}):
               </label>
               <input
                 type="number"
@@ -556,7 +625,7 @@ export const TabFloorReconciliation: React.FC = () => {
             <div>
               <div className="flex justify-between items-center mb-1.5">
                 <label className="text-xs font-bold text-[#6B7280] uppercase tracking-wider flex items-center gap-1.5">
-                  <span>TEÓRICO ERP ({selectedDiscrepancy.targetDeposit || '150103'}):</span>
+                  <span>TEÓRICO ERP ({formatDepositLabel(selectedDiscrepancy.targetDeposit || '150103')}):</span>
                   {!isFetchingLive && (
                     apiFetchFailed ? (
                       <span className="text-[10px] text-[#F59E0B] font-bold bg-amber-50 px-2 py-0.5 rounded-full border border-[#F59E0B]/30">
@@ -722,7 +791,7 @@ export const TabFloorReconciliation: React.FC = () => {
                           SKU: {disc.skuCode}
                         </span>
                         <span className="text-[11px] font-semibold text-[#6B7280]">
-                          Origen: <strong className="text-[#1F2937]">{disc.originDeposit}</strong> &rarr; Destino: <strong className="text-[#1F2937]">{disc.targetDeposit}</strong>
+                          Origen: <strong className="text-[#1F2937]">{formatDepositLabel(disc.originDeposit)}</strong> &rarr; Destino: <strong className="text-[#1F2937]">{formatDepositLabel(disc.targetDeposit)}</strong>
                         </span>
                       </div>
                       <h4 className="text-base sm:text-lg font-black text-[#1F2937] tracking-tight leading-tight">
@@ -744,13 +813,23 @@ export const TabFloorReconciliation: React.FC = () => {
                         </span>
                       </div>
 
-                      <button
-                        onClick={() => handleSelectDiscrepancy(disc as FloorDiscrepancy)}
-                        className="btn-collector bg-[#009045] hover:bg-[#007a3a] text-white min-h-[48px] px-4 rounded-[8px] font-bold text-xs sm:text-sm flex items-center gap-1.5 shrink-0 shadow-xs"
-                      >
-                        <span>Verificar</span>
-                        <ArrowRight className="w-4 h-4" />
-                      </button>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => setDiscrepancyToCancel(disc as FloorDiscrepancy)}
+                          className="btn-collector bg-white hover:bg-red-50 text-[#6B7280] hover:text-[#DC2626] border border-[#E5E7EB] hover:border-red-200 min-h-[48px] px-3 rounded-[8px] flex items-center justify-center transition shadow-2xs"
+                          title="Descartar / Cancelar discrepancia falsa"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                        <button
+                          onClick={() => handleSelectDiscrepancy(disc as FloorDiscrepancy)}
+                          className="btn-collector bg-[#009045] hover:bg-[#007a3a] text-white min-h-[48px] px-4 rounded-[8px] font-bold text-xs sm:text-sm flex items-center gap-1.5 shadow-xs"
+                        >
+                          <span>Verificar</span>
+                          <ArrowRight className="w-4 h-4" />
+                        </button>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -800,17 +879,18 @@ export const TabFloorReconciliation: React.FC = () => {
                     <span>
                       Mover {tr.TransferQuantity || tr.TransferredQuantity || tr.transferredQuantity} u
                     </span>
-                    <span className="bg-[#F8F9FA] px-1.5 py-0.5 rounded-[8px] border border-[#E5E7EB] text-[#1F2937]">
-                      De: {tr.FromDeposit || tr.OriginDeposit || tr.originDeposit}
+                    <span className="bg-[#F8F9FA] px-2 py-0.5 rounded-[8px] border border-[#E5E7EB] text-[#1F2937]">
+                      De: {formatDepositLabel(tr.FromDeposit || tr.OriginDeposit || tr.originDeposit)}
                     </span>
                     <ArrowRightLeft className="w-3 h-3 text-[#263988]" />
-                    <span className="bg-[#F8F9FA] px-1.5 py-0.5 rounded-[8px] border border-[#E5E7EB] text-[#1F2937]">
-                      A: {tr.ToDeposit || tr.DestinationDeposit || tr.destinationDeposit}
+                    <span className="bg-[#F8F9FA] px-2 py-0.5 rounded-[8px] border border-[#E5E7EB] text-[#1F2937]">
+                      A: {formatDepositLabel(tr.ToDeposit || tr.DestinationDeposit || tr.destinationDeposit)}
                     </span>
                   </div>
                 </div>
               <button
-                onClick={() => handleApproveTransfer(tr)}
+                type="button"
+                onClick={() => setTransferToConfirm(tr)}
                 className="bg-[#263988] hover:bg-[#1d2c6b] text-white px-5 py-2.5 rounded-[8px] font-black text-sm flex items-center justify-center gap-2 active:scale-95 transition shadow-xs w-full sm:w-auto shrink-0"
               >
                 <CheckCircle2 className="w-4 h-4" /> CONFIRMAR ERP
@@ -820,6 +900,151 @@ export const TabFloorReconciliation: React.FC = () => {
         })
       )}
       </div>
+
+      {/* MODAL ESTILIZADO: CANCELACIÓN / DESCARTE DE DISCREPANCIA FALSA */}
+      {discrepancyToCancel && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-fadeIn">
+          <div className="bg-white rounded-[16px] max-w-md w-full p-5 sm:p-6 space-y-4 modal-elevation border border-[#E5E7EB]">
+            <div className="flex items-center gap-3">
+              <div className="p-3 bg-red-100 rounded-full text-[#DC2626] shrink-0">
+                <Trash2 className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="text-base font-black text-[#1F2937]">Descartar Discrepancia</h3>
+                <p className="text-xs text-[#6B7280]">Marcar como CANCELADA en la base de datos</p>
+              </div>
+            </div>
+
+            <div className="bg-[#F8F9FA] rounded-[8px] p-3 text-xs space-y-2 border border-[#E5E7EB]">
+              <div className="flex items-center justify-between">
+                <span className="font-mono font-bold text-[#263988] bg-blue-50 px-2 py-0.5 rounded-full border border-[#263988]/20">
+                  SKU: {discrepancyToCancel.skuCode}
+                </span>
+                <span className="text-[11px] font-bold text-[#6B7280]">
+                  {Number(discrepancyToCancel.originDiscrepancy || 0) < 0 ? 'Faltante: ' : 'Sobrante: '}
+                  {Number(discrepancyToCancel.originDiscrepancy || 0).toFixed(2)} u
+                </span>
+              </div>
+              <p className="font-bold text-[#1F2937] text-sm">
+                {(() => {
+                  const skuTrimmed = (discrepancyToCancel.skuCode || '').trim();
+                  const matchingTask = tasks.find((t) => (t.SkuCode || t.skuCode || '').trim() === skuTrimmed);
+                  return matchingTask?.SkuDescription || matchingTask?.skuDescription || discrepancyToCancel.skuDescription || 'Artículo auditado';
+                })()}
+              </p>
+              <div className="text-[11px] text-[#6B7280] space-y-0.5 pt-1 border-t border-[#E5E7EB]">
+                <div>Origen: <strong>{formatDepositLabel(discrepancyToCancel.originDeposit)}</strong></div>
+                <div>Destino: <strong>{formatDepositLabel(discrepancyToCancel.targetDeposit)}</strong></div>
+              </div>
+            </div>
+
+            <p className="text-xs text-[#B45309] font-medium bg-amber-50 p-2.5 rounded-[8px] border border-amber-200">
+              ¿Está seguro de descartar esta discrepancia? El registro pasará a estado <strong>CANCELADA</strong> y ya no se mostrará como pendiente para validar en piso.
+            </p>
+
+            <div className="flex gap-2.5 pt-1">
+              <button
+                type="button"
+                disabled={isSubmitting}
+                onClick={() => setDiscrepancyToCancel(null)}
+                className="flex-1 min-h-[44px] bg-[#F8F9FA] hover:bg-[#E5E7EB] text-[#1F2937] font-bold text-xs rounded-[8px] border border-[#E5E7EB] transition disabled:opacity-50"
+              >
+                Volver
+              </button>
+              <button
+                type="button"
+                disabled={isSubmitting}
+                onClick={handleConfirmCancelDiscrepancy}
+                className="flex-1 min-h-[44px] bg-[#DC2626] hover:bg-[#b91c1c] text-white font-black text-xs rounded-[8px] shadow-xs active:scale-95 transition flex items-center justify-center gap-1.5 disabled:opacity-50"
+              >
+                {isSubmitting ? (
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Trash2 className="w-4 h-4" />
+                )}
+                <span>Sí, descartar</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL ESTILIZADO: CONFIRMACIÓN DE TRASLADO EN EL ERP */}
+      {transferToConfirm && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-fadeIn">
+          <div className="bg-white rounded-[16px] max-w-md w-full p-5 sm:p-6 space-y-4 modal-elevation border border-[#E5E7EB]">
+            <div className="flex items-center gap-3">
+              <div className="p-3 bg-[#263988]/10 rounded-full text-[#263988] shrink-0">
+                <ArrowRightLeft className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="text-base font-black text-[#1F2937]">Confirmar Traslado en ERP</h3>
+                <p className="text-xs text-[#6B7280]">Validación física y contable del movimiento</p>
+              </div>
+            </div>
+
+            <div className="bg-[#F8F9FA] rounded-[8px] p-3 text-xs space-y-2 border border-[#E5E7EB]">
+              <div className="flex items-center justify-between">
+                <span className="font-mono font-bold text-[#263988] bg-blue-50 px-2 py-0.5 rounded-full border border-[#263988]/20">
+                  SKU: {transferToConfirm.SkuCode || transferToConfirm.skuCode}
+                </span>
+                <span className="font-mono font-black text-sm text-[#009045] bg-emerald-50 px-2 py-0.5 rounded-full border border-[#009045]/20">
+                  {transferToConfirm.TransferQuantity || transferToConfirm.TransferredQuantity || 0} u
+                </span>
+              </div>
+              <p className="font-bold text-[#1F2937] text-sm">
+                {(() => {
+                  const trSku = (transferToConfirm.SkuCode || transferToConfirm.skuCode || '').trim();
+                  const matchingTask = tasks.find((t) => (t.SkuCode || t.skuCode || '').trim() === trSku);
+                  return matchingTask?.SkuDescription || matchingTask?.skuDescription || transferToConfirm.SkuDescription || transferToConfirm.skuDescription || 'Artículo';
+                })()}
+              </p>
+              <div className="p-2.5 bg-white rounded-[6px] border border-[#E5E7EB] space-y-1.5 font-mono text-[11px]">
+                <div className="flex items-center justify-between text-[#6B7280]">
+                  <span>Desde:</span>
+                  <strong className="text-[#1F2937]">
+                    {formatDepositLabel(transferToConfirm.FromDeposit || transferToConfirm.OriginDeposit || transferToConfirm.originDeposit)}
+                  </strong>
+                </div>
+                <div className="flex items-center justify-between text-[#6B7280]">
+                  <span>Hacia:</span>
+                  <strong className="text-[#1F2937]">
+                    {formatDepositLabel(transferToConfirm.ToDeposit || transferToConfirm.DestinationDeposit || transferToConfirm.destinationDeposit)}
+                  </strong>
+                </div>
+              </div>
+            </div>
+
+            <p className="text-xs text-[#4B5563] bg-blue-50/60 p-2.5 rounded-[8px] border border-[#263988]/20 leading-relaxed">
+              ¿Confirma que este traslado físico entre depósitos ya fue ejecutado o cargado en el sistema ERP?
+            </p>
+
+            <div className="flex gap-2.5 pt-1">
+              <button
+                type="button"
+                disabled={isSubmitting}
+                onClick={() => setTransferToConfirm(null)}
+                className="flex-1 min-h-[46px] bg-[#F8F9FA] hover:bg-[#E5E7EB] text-[#1F2937] font-bold text-xs rounded-[8px] border border-[#E5E7EB] transition disabled:opacity-50"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={isSubmitting}
+                onClick={handleExecuteTransferConfirm}
+                className="flex-1 min-h-[46px] bg-[#009045] hover:bg-[#007a3a] text-white font-black text-xs rounded-[8px] shadow-xs active:scale-95 transition flex items-center justify-center gap-1.5 disabled:opacity-50"
+              >
+                {isSubmitting ? (
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                ) : (
+                  <CheckCircle2 className="w-4 h-4" />
+                )}
+                <span>CONFIRMAR TRASLADO</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* TOAST FLOTANTE */}
       {toast && (

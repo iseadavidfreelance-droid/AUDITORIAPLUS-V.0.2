@@ -15,7 +15,7 @@ export const DEPOSIT_NAMES: Record<DepositCode, string> = {
 
 export type TaskStatus = 'PENDING' | 'COMPLETED' | 'COMPLETED_MATCH' | 'DISCREPANT' | 'RECONCILED' | 'PARTIALLY_RECONCILED';
 
-export type DiscrepancyStatus = 'OPEN' | 'RESOLVED' | 'PENDING_TARGET_COUNT' | 'COUNTED_VALIDATED' | 'PENDING_TRANSFER_APPROVAL';
+export type DiscrepancyStatus = 'OPEN' | 'RESOLVED' | 'PENDING_TARGET_COUNT' | 'COUNTED_VALIDATED' | 'PENDING_TRANSFER_APPROVAL' | 'CANCELADA';
 
 export interface MissionMetrics {
   totalSkus: number;
