@@ -513,20 +513,31 @@ export const useMissionStore = create<MissionState>((set, get) => ({
   setActiveMissionId: (missionId) => set({ activeMissionId: missionId }),
 
   setActiveMission: (mission) =>
-    set({
-      activeMission: mission,
-      activeMissionId: mission?.missionId || null,
-      metrics: mission
-        ? {
-            totalSkus: mission.totalSkus,
-            pendingSkus: mission.pendingSkus,
-            countedSkus: mission.countedSkus,
-            discrepantSkus: mission.discrepantSkus,
-            reconciledSkus: mission.reconciledSkus,
-            totalCostDiscrepancy: mission.totalCostDiscrepancy,
-            missionId: mission.missionId,
-          }
-        : { ...initialMetrics },
+    set((state) => {
+      const preserveTaskMetrics = state.tasks.length > 0;
+      const currentCalculated = preserveTaskMetrics
+        ? calculateMetricsFromTasks(state.tasks, mission?.missionId || state.activeMissionId)
+        : null;
+
+      const safeCost = (mission?.totalCostDiscrepancy !== undefined && mission?.totalCostDiscrepancy !== 0)
+        ? mission.totalCostDiscrepancy
+        : (currentCalculated?.totalCostDiscrepancy ?? state.metrics.totalCostDiscrepancy ?? 0);
+
+      return {
+        activeMission: mission ? { ...mission, totalCostDiscrepancy: safeCost } : null,
+        activeMissionId: mission?.missionId || null,
+        metrics: mission
+          ? {
+              totalSkus: currentCalculated?.totalSkus ?? mission.totalSkus,
+              pendingSkus: currentCalculated?.pendingSkus ?? mission.pendingSkus,
+              countedSkus: currentCalculated?.countedSkus ?? mission.countedSkus,
+              discrepantSkus: currentCalculated?.discrepantSkus ?? mission.discrepantSkus,
+              reconciledSkus: currentCalculated?.reconciledSkus ?? mission.reconciledSkus,
+              totalCostDiscrepancy: safeCost,
+              missionId: mission.missionId,
+            }
+          : { ...initialMetrics },
+      };
     }),
 
   setTasks: (taskList) => {

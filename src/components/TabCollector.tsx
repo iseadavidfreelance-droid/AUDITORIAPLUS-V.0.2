@@ -538,38 +538,6 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
           console.warn('[TabCollector] Error actualizando Read_Mission_Tasks en Supabase:', dbUpdateErr);
         }
 
-        // Insertar en EventStore cumpliendo arquitectura CQRS estricta (/docs/estructura_supabase_actualizada.ts)
-        const generateUUID = () => {
-          return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-            const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
-            return v.toString(16);
-          });
-        };
-
-        const { error: eventError } = await supabase.from('EventStore').insert({
-          EventId: generateUUID(),
-          EventType: 'PhysicalCountRegistered',
-          AggregateId: taskIdToUse,
-          AggregateType: 'MissionTask',
-          UserId: user.id,
-          CorrelationId: generateUUID(),
-          Payload: payload,
-          Metadata: {
-            auditor_name: auditorName,
-            sku_code: skuCodeToUse,
-            counted_quantity: countedQty,
-            system_quantity: finalSystemQty,
-            discrepancy
-          },
-          SequenceNum: 1,
-          Timestamp: nowIso,
-          Version: 1
-        });
-
-        if (eventError) {
-          console.warn('[TabCollector] Advertencia al registrar en EventStore:', eventError);
-        }
-
         // Si se generó discrepancia, persistir en Read_Floor_Discrepancies con SkuDescription real
         if (discrepancy !== 0) {
           await supabase.from('Read_Floor_Discrepancies').upsert({
@@ -590,36 +558,11 @@ export const TabCollector: React.FC<TabCollectorProps> = ({ onNavigateToFloor })
             .from('Read_Floor_Discrepancies')
             .update({
               Status: 'CANCELADA',
-              ResolvedAt: nowIso,
               UpdatedAt: nowIso
             })
             .eq('MissionId', missionIdToUse)
             .eq('SkuCode', skuCodeToUse)
             .or('Status.eq.OPEN,Status.eq.PENDING_TARGET_COUNT,Status.eq.PENDING_FLOOR_COUNT');
-
-          // Registrar evento explícito en EventStore
-          await supabase.from('EventStore').insert({
-            EventId: generateUUID(),
-            EventType: 'DiscrepancyCancelled',
-            AggregateId: taskIdToUse,
-            AggregateType: 'FloorDiscrepancy',
-            UserId: user.id,
-            CorrelationId: generateUUID(),
-            Payload: {
-              sku_code: skuCodeToUse,
-              mission_id: missionIdToUse,
-              reason: 'RECOUNT_CONCILIATED_ZERO_DISCREPANCY',
-              counted_quantity: countedQty,
-              system_quantity: finalSystemQty
-            },
-            Metadata: {
-              source: 'TabCollector',
-              auditor_name: auditorName
-            },
-            SequenceNum: 1,
-            Timestamp: nowIso,
-            Version: 1
-          });
 
           // Actualizar store local de discrepancias reactivamente
           const currentPending = useDiscrepancyStore.getState().pendingFloorDiscrepancies || [];

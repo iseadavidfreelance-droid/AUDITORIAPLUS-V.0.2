@@ -1,96 +1,376 @@
-# Plan de Implementación: Optimizaciones Operativas, Cancelación de Discrepancias Falsas y Teclado ERP
+# Diagnóstico y Plan de Corrección: Supabase, Edge Functions y Arquitectura de Datos
 
-Este plan aborda las mejoras operativas solicitadas para maximizar la velocidad de auditoría en colectores Android y smartphones, garantizando la consistencia del modelo CQRS y el esquema Supabase (`Read_Floor_Discrepancies`, `Read_Mission_Tasks`, `Read_Virtual_Transfers` y `EventStore`).
+1-2 oraciones que resumen el objetivo general:
+Diagnóstico exhaustivo y plan de solución para los 4 errores operativos en la integración con Supabase y Edge Functions (error de esquema `ResolvedAt`, colisión de clave única en `EventStore`, sincronización de traslados virtuales confirmados en Reportes, y visualización inestable del Impacto Financiero en Costo).
 
 ---
 
-## 1. User Review Required (Puntos Clave y Decisiones)
+## Decisiones Críticas Confirmadas
 
 > [!IMPORTANT]
-> - **Escaneo Automático en Colectores Android**: Se implementa detección dual en el campo de búsqueda: captura instantánea de la tecla `Enter` emitida por lectores hardware (wedge de teclado) y debounce automático de 280ms cuando se ingresa o pega un código completo (evitando tener que presionar manualmente el botón "Buscar").
-> - **Cancelación Automática de Discrepancias Resueltas**: Si un producto tenía una discrepancia pendiente en piso y luego en un re-conteo se concilia a diferencia 0 (o el stock cuadrado), la discrepancia en `Read_Floor_Discrepancies` pasará automáticamente a estado `CANCELADA` y se emitirá el evento correspondiente en `EventStore`.
-> - **Borrado Manual de Discrepancias Falsas con Modal**: En la pestaña Discrepancias, cada tarjeta incluirá un botón para descartar/eliminar la discrepancia. No se usará `window.confirm`, sino un modal estilizado con el look & feel de la app. La discrepancia pasará a estado `CANCELADA` en Supabase y se ocultará de la lista de pendientes.
-> - **Preconteo y Botones Centrados en ERP**: Si el ERP indica por ejemplo 10 unidades, el campo numérico vendrá pre-llenado con 10 y los botones rápidos táctiles mostrarán los valores directos: `[8]`, `[9]`, `[10]`, `[11]`, `[12]` (calculados como `ERP - 2`, `ERP - 1`, `ERP`, `ERP + 1`, `ERP + 2`).
-> - **Modal Estilizado para Aprobación de Traslados**: Se reemplaza el `window.confirm` nativo del navegador por un modal nativo en React con tipografía, tarjetas de depósito con badges y confirmación visual clara.
-> - **Nombres de Depósitos**: `150101` se mostrará como **ALMACÉN (150101)** y `150103` como **PISO DE VENTAS (150103)** en todas las tarjetas y modales.
+> Decisiones operativas y de arquitectura acordadas con el usuario para mantener estricta fidelidad con el esquema de `/docs/estructura_supabase_actualizada.ts`:
+
+- **Decisión 1 (Error PGRST204 en Discrepancias)**: Se mantendrá intacto el esquema de `Read_Floor_Discrepancies` sin añadir columnas adicionales. Se retirará cualquier referencia a `ResolvedAt` en el código cliente y se utilizará exclusivamente `Status: 'CANCELADA'` (o `'RESOLVED'`) junto con `UpdatedAt: ISOString`.
+- **Decisión 2 (Error 23505 en EventStore al Contar)**: El Frontend actualizará directamente las tablas de lectura (`Read_Mission_Tasks` y `Read_Floor_Discrepancies`) para una respuesta visual instantánea, mientras que la Edge Function `register-count` será la responsable única de registrar el evento inmutable en `EventStore`, inyectando `EventId: crypto.randomUUID()` y `Timestamp` garantizando unicidad absoluta sin colisiones de clave primaria.
+- **Decisión 3 (Estandarización de Traslados Confirmados)**: Se estandariza el estatus `COMPLETED` tanto en la base de datos `Read_Virtual_Transfers`, en el payload del evento de la Edge Function `confirm-transfer`, como en el filtro de la pestaña Reportes (con tolerancia a `EXECUTED` para retrocompatibilidad).
+- **Decisión 4 (Impacto en Costo Robusto)**: El KPI financiero se calculará en tiempo real y reactivamente a partir de los SKUs cargados (`sum(Discrepancy * Cost)`), evitando que el sondeo periódico de 15 segundos sobreescriba el valor con ceros o nulos provenientes de `Read_Missions`.
 
 ---
 
-## 2. Proposed Changes
+## 1. Análisis Causa-Raíz de los 4 Problemas
 
-### Módulo de Utilidades de Depósitos
-#### `src/lib/deposits.ts`
-* Crear función utilitaria `formatDepositLabel(code)`:
-  * `'150101'` &rarr; `ALMACÉN (150101)`
-  * `'150103'` &rarr; `PISO DE VENTAS (150103)`
-  * Otros &rarr; `DEP. {code}`
+### Problema 1: `PGRST204 - Could not find the 'ResolvedAt' column of 'Read_Floor_Discrepancies'`
+* **Causa**: Según `/docs/estructura_supabase_actualizada.ts`, la tabla `Read_Floor_Discrepancies` posee únicamente: `DiscrepancyId`, `MissionId`, `OriginDeposit`, `OriginDiscrepancy`, `SkuCode`, `SkuDescription`, `Status`, `TargetCountedQuantity`, `TargetDeposit`, `TargetDiscrepancy`, `TargetSystemQuantity`, `CreatedAt` y `UpdatedAt`. En `TabCollector.tsx` (línea 593) y `TabFloorReconciliation.tsx` (línea 380) se enviaba el campo `ResolvedAt: nowIso`, disparando el rechazo inmediato de la API de PostgREST.
+* **Solución**: Limpiar el payload de actualización a únicamente `{ Status: 'CANCELADA', UpdatedAt: nowIso }`.
 
----
+### Problema 2: `23505 - duplicate key value violates unique constraint "EventStore_pkey"`
+* **Causa**:
+  1. `TabCollector.tsx` estaba realizando **doble escritura**: primero insertaba directamente en `EventStore` desde el cliente con `SequenceNum: 1, Version: 1` y luego invocaba `register-count`.
+  2. En `register-count/index.ts`, la Edge Function insertaba en `EventStore` **sin** especificar un `EventId` explícito con UUID (`crypto.randomUUID()`), dejando el campo a merced del valor por defecto de Postgres o generando colisiones si se realizaba un re-conteo sobre la misma tarea.
+* **Solución**:
+  - Eliminar la inserción duplicada en `TabCollector.tsx` previa a la Edge Function.
+  - Asegurar que `register-count/index.ts` siempre asigne `EventId: crypto.randomUUID()`, `Timestamp: new Date().toISOString()`, `SequenceNum: Date.now()`, y `Version: 1`.
 
-### Escaneo Automático y Teclado Centrado en ERP
-#### `src/components/TabCollector.tsx`
-1. **Detección Automática de Colector de Datos**:
-   * En el input de SKU (`scannerInputRef`), agregar listener `onKeyDown` para detectar la tecla `Enter` enviada por el láser del colector y disparar `processDetectedCode` inmediatamente sin esperar clic.
-   * Agregar efecto con debounce (280ms) en `searchTerm`: cuando se ingresa un código con longitud $\ge 3$ de manera continua o mediante escaneo rápido, ejecutar automáticamente la búsqueda y limpiar el término sin requerir pulsar "Buscar".
-2. **Pre-conteo Automático**:
-   * Al escanear un SKU y obtener la cantidad teórica del ERP (o de la misión si offline), si la tarea no estaba contada previamente (o en modo re-conteo), pre-escribir el valor teórico en `countedInput` y enfocar el campo con selección de texto para confirmación inmediata.
-3. **Teclado Táctil Centrado en ERP**:
-   * Reemplazar los botones genéricos `+1, +5, +10, +25, -1` por 5 botones inteligentes calculados sobre `finalSystemQty`:
-     * Botón `ERP - 2`: ej. `8` (o `0` si menor a 0)
-     * Botón `ERP - 1`: ej. `9` (o `0` si menor a 0)
-     * Botón `ERP` (Exacto): ej. `10` con destacado visual (borde verde esmeralda y etiqueta de coincidencia)
-     * Botón `ERP + 1`: ej. `11`
-     * Botón `ERP + 2`: ej. `12`
-     * Botón extra `0` o reset para casos de faltante total.
-4. **Cancelación Automática de Discrepancia al Conciliar SKU**:
-   * En `handleRegisterCount`, si el resultado del re-conteo es `discrepancy === 0`:
-     * Consultar y actualizar en `Read_Floor_Discrepancies` cualquier registro con `MissionId = activeMissionId` y `SkuCode = skuCodeToUse` cuyo estado sea `PENDING_TARGET_COUNT` o `OPEN` a `CANCELADA`.
-     * Registrar evento en `EventStore`: `DiscrepancyCancelled` con metadata de auditoría.
-     * Actualizar el store local `useDiscrepancyStore` para reflejar la cancelación de inmediato.
+### Problema 3: Traslados Virtuales Confirmados no aparecen en Reportes
+* **Causa**:
+  1. En `TabFloorReconciliation.tsx` (líneas 486-494), existía una condición invertida:
+     ```ts
+     if (eventError) {
+       await supabase.from('Read_Virtual_Transfers').update({ Status: 'COMPLETED' })
+     }
+     ```
+     ¡Solo actualizaba `Read_Virtual_Transfers` si la inserción en `EventStore` fallaba! En el flujo exitoso normal, `Read_Virtual_Transfers` jamás se actualizaba a `COMPLETED` en Supabase.
+  2. La función Edge `confirm-transfer/index.ts` solo insertaba un evento en `EventStore` con status `'EXECUTED'`, pero nunca actualizaba la proyección en `Read_Virtual_Transfers`.
+  3. En `TabReports.tsx`, el filtro `executedTransfers` solo buscaba `Status === 'COMPLETED'`.
+* **Solución**:
+  - Corregir `TabFloorReconciliation.tsx` para actualizar siempre `Read_Virtual_Transfers` a `COMPLETED`.
+  - Actualizar `supabase/functions/confirm-transfer/index.ts` para proyectar la actualización a `Read_Virtual_Transfers` y registrar el evento con UUID.
+  - Hacer el filtro de `TabReports.tsx` tolerante a `COMPLETED` y `EXECUTED`.
 
----
-
-### Cancelación Manual y Modal Estilizado de Traslados
-#### `src/components/TabFloorReconciliation.tsx`
-1. **Eliminación / Descarte de Discrepancia Falsa (Estado CANCELADA)**:
-   * En cada tarjeta de "Pendientes por Verificar", agregar un botón de acción rápida con icono `<Trash2 />` / `<X />` titulado "Descartar / Cancelar Discrepancia".
-   * Crear estado `discrepancyToCancel: FloorDiscrepancy | null`.
-   * Al presionar, abrir modal estilizado con advertencia: "¿Desea cancelar esta discrepancia? La discrepancia para el SKU {código} pasará a estado CANCELADA y se excluirá de las tareas pendientes."
-   * Al confirmar:
-     * Actualizar `Read_Floor_Discrepancies`: `Status: 'CANCELADA'`, `ResolvedAt: nowIso`.
-     * Registrar evento en `EventStore`: `EventType: 'DiscrepancyCancelled'`.
-     * Remover de `pendingFloorDiscrepancies` y notificar mediante toast estilizado.
-2. **Reemplazo de `window.confirm` por Modal Estilizado de Aprobación de Traslado**:
-   * Eliminar `window.confirm(...)` en `handleApproveTransfer`.
-   * Crear estado `transferToConfirm: any | null`.
-   * Renderizar un modal nativo en React con:
-     * Título: "Confirmar Traslado en ERP".
-     * Resumen: SKU, descripción, cantidad a mover.
-     * Origen y Destino con nombres descriptivos: `ALMACÉN (150101) → PISO DE VENTAS (150103)`.
-     * Botones "Cancelar" y "Confirmar Traslado ERP".
-3. **Nombres Descriptivos de Depósito**:
-   * En las tarjetas de discrepancias, en el panel de verificación y en los traslados sugeridos, reemplazar códigos puros por `formatDepositLabel` (`ALMACÉN (150101)` y `PISO DE VENTAS (150103)`).
+### Problema 4: "IMPACTO EN COSTO" intermitente o bugeado
+* **Causa**:
+  1. Cada 15 segundos, `App.tsx` consulta `Read_Missions` y llama a `setActiveMission` inyectando `data.TotalCostDiscrepancy ?? 0`.
+  2. Si en la base de datos Supabase la columna `TotalCostDiscrepancy` de `Read_Missions` tiene `0` o `null` (porque no hay un trigger en la BD recalculándola continuamente), el sondeo periódico sobreescribía el cálculo reactivo que `useMissionStore` había calculado a partir de las tareas.
+  3. `TabReports.tsx` leía únicamente `metrics.totalCostDiscrepancy`.
+* **Solución**:
+  - En `TabReports.tsx`, calcular el valor en vivo a partir de las tareas:
+    `tasks.reduce((sum, t) => sum + (Number(t.Discrepancy ?? 0) * Number(t.Cost ?? 0)), 0)`.
+  - En `useMissionStore.ts`, en `setActiveMission`, no sobreescribir `metrics.totalCostDiscrepancy` con 0 si ya existen tareas cargadas en el cliente con discrepancias calculadas.
 
 ---
 
-## 3. Verification Plan
+## 2. Arquitectura del Flujo Corregido
 
-### Verificación Automatizada
-1. `compile_applet`: Verificar compilación de Vite y bundles sin errores de sintaxis o tipos.
-2. `lint_applet`: Asegurar cero errores de linter y tipado estricto en TypeScript.
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                          APLICACIÓN AUDITORÍA                          │
+└────────────────────────────────────┬───────────────────────────────────┘
+                                     │
+           ┌─────────────────────────┴────────────────────────┐
+           ▼                                                  ▼
+ ┌──────────────────────┐                           ┌────────────────────┐
+ │  TabCollector        │                           │ TabFloorReconcil.  │
+ │  (Conteo / Recalculo)│                           │ (Confirmar Trasl.) │
+ └─────────┬────────────┘                           └─────────┬──────────┘
+           │                                                  │
+           ├─► Actualiza Read_Mission_Tasks                   ├─► Actualiza Read_Floor_Discrepancies
+           │   (Status, Discrepancy, CountedQty)              │   (Status: 'RESOLVED', sin ResolvedAt)
+           │                                                  │
+           ├─► Si disc == 0: Cancela Discrepancia             ├─► Actualiza Read_Virtual_Transfers
+           │   (Status: 'CANCELADA', sin ResolvedAt)          │   (Status: 'COMPLETED', UpdatedAt)
+           │                                                  │
+           ▼                                                  ▼
+ ┌──────────────────────────────────┐               ┌──────────────────────────────────┐
+ │ Edge Function: register-count    │               │ Edge Function: confirm-transfer  │
+ │ - EventId: crypto.randomUUID()   │               │ - EventId: crypto.randomUUID()   │
+ │ - Evento único en EventStore     │               │ - Proyecta en Read_Virtual_Trans.│
+ │ - Sin colisión 23505             │               │ - Evento VirtualTransferExecuted │
+ └──────────────────────────────────┘               └──────────────────────────────────┘
+                                     │
+                                     ▼
+                      ┌──────────────────────────────┐
+                      │ TabReports                   │
+                      │ - Traslados: COMPLETED       │
+                      │ - Costo: suma reactiva tasks │
+                      │   (inmune al sondeo de 15s)  │
+                      └──────────────────────────────┘
+```
 
-### Verificación Manual de Flujos
-1. **Escaneo en Colector**:
-   * Ingresar un código de barras simulando lector o escribir con enter: el SKU debe cargarse de inmediato sin necesidad de hacer clic en "Buscar".
-2. **Preconteo y Botones ERP**:
-   * Al cargar un SKU con existencia teórica de 10: verificar que el input muestra `10` y los botones rápidos muestran `8`, `9`, `10`, `11`, `12`.
-   * Tocar el botón `9`: el input debe actualizarse a `9` y mostrar la discrepancia `-1.00`.
-3. **Cancelación Automática de Discrepancia**:
-   * Registrar un SKU con discrepancia (ej. faltante -1). Aparece en "Discrepancias".
-   * Volver a la pestaña Conteo, re-auditar el SKU e ingresar la cantidad exacta igual al ERP.
-   * Verificar que en "Discrepancias" la discrepancia ya no figura como pendiente (pasa a `CANCELADA`).
-4. **Descarte Manual de Discrepancia**:
-   * En una discrepancia pendiente, hacer clic en el botón de eliminar: debe abrirse el modal estilizado (sin alertas nativas del navegador).
-   * Confirmar la cancelación: la tarjeta debe desaparecer y actualizarse en Supabase.
-5. **Aprobación de Traslado Estilizada**:
-   * En "Traslados Sugeridos", pulsar "Confirmar ERP": debe abrirse el modal estilizado mostrando `ALMACÉN (150101)` y `PISO DE VENTAS (150103)` sin alertas nativas.
+---
+
+## 3. Modificaciones Detalladas por Archivo
+
+### Archivo 1: `src/components/TabCollector.tsx`
+- **Eliminar `ResolvedAt`**: Cambiar la actualización de `Read_Floor_Discrepancies` para enviar exclusivamente `{ Status: 'CANCELADA', UpdatedAt: nowIso }`.
+- **Eliminar doble inserción directa en EventStore**: Retirar las llamadas locales directas `supabase.from('EventStore').insert(...)` previas a `register-count` para evitar colisión de claves y duplicación de eventos. La Edge Function `register-count` se encarga del registro oficial del evento.
+
+### Archivo 2: `src/components/TabFloorReconciliation.tsx`
+- **Eliminar `ResolvedAt`**: En el flujo de cancelación / eliminación manual de discrepancias, enviar `{ Status: 'CANCELADA', UpdatedAt: nowIso }`.
+- **Corregir confirmación de traslados**:
+  - Asegurar que `Read_Virtual_Transfers` se actualice SIEMPRE a `Status: 'COMPLETED'` de forma directa e independiente de si hay error en el EventStore.
+  - Invocar la Edge Function `confirm-transfer` para mantener la sincronización con el backend.
+
+### Archivo 3: `src/components/TabReports.tsx`
+- **Cálculo Blindado de Impacto en Costo**:
+  ```ts
+  const computedCostImpact = useMemo(() => {
+    if (!tasks || tasks.length === 0) return Math.abs(metrics.totalCostDiscrepancy || 0);
+    const sum = tasks.reduce((acc, t) => {
+      const disc = Number(t.Discrepancy ?? 0);
+      const cost = Number(t.Cost ?? 0);
+      return acc + (disc * cost);
+    }, 0);
+    return Math.abs(sum);
+  }, [tasks, metrics.totalCostDiscrepancy]);
+  ```
+- **Filtro de Traslados Confirmados**:
+  ```ts
+  const executedTransfers = useMemo(() => {
+    return virtualTransfers.filter((vt) => {
+      const st = String(vt.Status || (vt as any).status || '').toUpperCase();
+      return st === 'COMPLETED' || st === 'EXECUTED';
+    });
+  }, [virtualTransfers]);
+  ```
+
+### Archivo 4: `src/store/useMissionStore.ts`
+- En `setActiveMission`, si `mission.totalCostDiscrepancy` es `0` o `null`, pero el store ya tiene tareas cargadas con discrepancias, preservar el cálculo reactivo para no provocar saltos visuales durante el sondeo.
+
+### Archivo 5: `supabase/functions/register-count/index.ts`
+- Generar `EventId: crypto.randomUUID()` explícito tanto en `payloadToInsert` como en el evento secundario de discrepancia.
+- Asignar `Timestamp: new Date().toISOString()`, `SequenceNum: Date.now()`, y `Version: 1`.
+
+### Archivo 6: `supabase/functions/confirm-transfer/index.ts`
+- Asignar `EventId: crypto.randomUUID()` explícito en el evento `VirtualTransferExecuted`.
+- Actualizar de forma explícita `Read_Virtual_Transfers` con `{ Status: 'COMPLETED', UpdatedAt: new Date().toISOString() }` para que la lectura persista en la base de datos de Supabase.
+
+---
+
+## 4. Código y Scripts de Edge Functions para Supabase
+
+### Definición Actualizada: `supabase/functions/register-count/index.ts`
+```ts
+import { createClient } from "npm:@supabase/supabase-js@2.39.3";
+
+Deno.serve(async (req) => {
+  const origin = req.headers.get('Origin') || '*';
+  const requestedHeaders = req.headers.get('Access-Control-Request-Headers') || '*';
+
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'POST, GET, OPTIONS, PUT, DELETE',
+    'Access-Control-Allow-Headers': requestedHeaders,
+    'Access-Control-Max-Age': '86400',
+  };
+
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+
+  try {
+    const bodyText = await req.text();
+    const body = JSON.parse(bodyText);
+
+    const { 
+      mission_id, task_id, deposit_code, sku_code, 
+      counted_quantity, system_quantity, sales_during_audit, user_id,
+      target_deposit, target_system_quantity 
+    } = body;
+
+    const url = Deno.env.get('SUPABASE_URL') || '';
+    const key = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') || '';
+    const supabaseClient = createClient(url, key);
+
+    const safeCounted = Number(counted_quantity) || 0;
+    const safeSystem = Number(system_quantity) || 0;
+    const safeSales = Number(sales_during_audit) || 0;
+    const safeTargetSystem = Number(target_system_quantity) || 0;
+    const calculated_discrepancy = safeCounted - (safeSystem - safeSales);
+    const final_target_deposit = target_deposit || (deposit_code === '150101' ? '150103' : '150101');
+    const nowIso = new Date().toISOString();
+
+    const payloadToInsert = {
+      EventId: crypto.randomUUID(),
+      AggregateId: task_id,
+      AggregateType: 'MissionTask',
+      EventType: 'TaskCountRegistered',
+      UserId: user_id || '00000000-0000-0000-0000-000000000000',
+      CorrelationId: crypto.randomUUID(),
+      Payload: {
+        mission_id, task_id, deposit_code, sku_code,
+        counted_quantity: safeCounted, 
+        system_quantity: safeSystem, 
+        sales_during_audit: safeSales, 
+        calculated_discrepancy
+      },
+      Metadata: { client: "PWA_AuditoriaPlus_Interceptor_Live" },
+      SequenceNum: Date.now(),
+      Timestamp: nowIso,
+      Version: 1
+    };
+
+    const { error } = await supabaseClient.from('EventStore').insert(payloadToInsert);
+    if (error) throw new Error("Error Evento Principal: " + error.message);
+
+    if (calculated_discrepancy !== 0) {
+      const { error: discError } = await supabaseClient
+        .from('EventStore')
+        .insert({
+          EventId: crypto.randomUUID(),
+          AggregateId: task_id,
+          AggregateType: 'CrossDiscrepancy',
+          EventType: 'DiscrepancyDetected',
+          UserId: user_id || '00000000-0000-0000-0000-000000000000',
+          CorrelationId: crypto.randomUUID(),
+          Payload: {
+            discrepancy_id: crypto.randomUUID(),
+            mission_id,
+            origin_deposit: deposit_code,
+            target_deposit: final_target_deposit,
+            sku_code,
+            sku_description: "SKU " + sku_code,
+            origin_discrepancy: calculated_discrepancy,
+            target_system_quantity: safeTargetSystem,
+            status: "PENDING_TARGET_COUNT"
+          },
+          Metadata: { trigger: "auto_discrepancy" },
+          SequenceNum: Date.now(),
+          Timestamp: nowIso,
+          Version: 1
+        });
+        
+      if (discError) throw new Error("Error Evento Discrepancia: " + discError.message);
+    }
+
+    return new Response(
+      JSON.stringify({ 
+        status: "success", 
+        code: 200, 
+        data: { 
+          task_id, 
+          calculated_discrepancy, 
+          status: calculated_discrepancy === 0 ? 'COMPLETED_MATCH' : 'DISCREPANT' 
+        } 
+      }),
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+  } catch (err: any) {
+    return new Response(
+      JSON.stringify({ error: err instanceof Error ? err.message : 'Error desconocido' }),
+      { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    );
+  }
+});
+```
+
+### Definición Actualizada: `supabase/functions/confirm-transfer/index.ts`
+```ts
+import { createClient } from "npm:@supabase/supabase-js@2.39.3";
+
+Deno.serve(async (req) => {
+  const origin = req.headers.get('Origin') || '*';
+  const requestedHeaders = req.headers.get('Access-Control-Request-Headers') || '*';
+
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'POST, GET, OPTIONS, PUT, DELETE',
+    'Access-Control-Allow-Headers': requestedHeaders,
+    'Access-Control-Max-Age': '86400',
+  };
+
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+
+  try {
+    const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+    const bodyText = await req.text();
+    const body = JSON.parse(bodyText);
+
+    const { transfer_id, mission_id, sku_code, user_id } = body;
+
+    if (!transfer_id || !mission_id || !sku_code) {
+      return new Response(JSON.stringify({ error: 'Parámetros requeridos faltantes' }), {
+        status: 400,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      });
+    }
+
+    const userId = user_id || '00000000-0000-0000-0000-000000000000';
+    const correlationId = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
+
+    // 1. Registrar Evento Inmutable en EventStore con EventId único
+    const { error: eventError } = await supabase.from('EventStore').insert({
+      EventId: crypto.randomUUID(),
+      AggregateId: mission_id,
+      AggregateType: 'Mission',
+      EventType: 'VirtualTransferExecuted',
+      Payload: {
+        transfer_id,
+        mission_id,
+        sku_code,
+        status: 'COMPLETED',
+        manual_confirmation: true
+      },
+      Metadata: { source: 'edge_function_confirm_transfer' },
+      UserId: userId,
+      CorrelationId: correlationId,
+      SequenceNum: Date.now(),
+      Timestamp: nowIso,
+      Version: 1
+    });
+
+    if (eventError) throw new Error("Fallo al registrar evento: " + eventError.message);
+
+    // 2. Proyección directa en Read_Virtual_Transfers
+    const { error: updateError } = await supabase
+      .from('Read_Virtual_Transfers')
+      .update({
+        Status: 'COMPLETED',
+        UpdatedAt: nowIso
+      })
+      .eq('TransferId', transfer_id);
+
+    if (updateError) {
+      console.warn('Advertencia actualizando Read_Virtual_Transfers:', updateError);
+    }
+
+    return new Response(JSON.stringify({
+      success: true,
+      transfer_id,
+      status: 'COMPLETED'
+    }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      status: 200,
+    });
+  } catch (err: any) {
+    return new Response(JSON.stringify({ error: err.message }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      status: 400,
+    });
+  }
+});
+```
+
+---
+
+## 5. Plan de Verificación
+
+1. **Prueba de Cancelación de Discrepancias**:
+   - Abrir pestaña Discrepancias o realizar un re-conteo que nivele a 0.
+   - Verificar que no ocurra el error `PGRST204` y que el registro pase a `Status: 'CANCELADA'` con `UpdatedAt` actualizado.
+2. **Prueba de Conteo y EventStore**:
+   - Ingresar un conteo físico desde `TabCollector`.
+   - Confirmar que `Read_Mission_Tasks` se actualice de inmediato y que no salte el error `23505 duplicate key value violates unique constraint "EventStore_pkey"`.
+3. **Prueba de Traslados Virtuales en Reportes**:
+   - Confirmar un traslado sugerido en la pestaña Discrepancias.
+   - Navegar a la pestaña Reportes y verificar que aparezca en la lista "Traslados Virtuales Registrados" con estatus `COMPLETED`.
+4. **Prueba de Impacto Financiero en Costo**:
+   - Observar el KPI de Impacto en Costo durante más de 30 segundos (superando los ciclos de sondeo de 15s de `App.tsx`).
+   - Verificar que el valor se mantenga estable, correcto y fiel a las discrepancias y costos de los productos.
+5. **Verificación de Compilación**:
+   - Ejecutar `compile_applet` para garantizar que la compilación de TypeScript y Vite sea exitosa sin errores de tipado.

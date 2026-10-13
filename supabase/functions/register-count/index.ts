@@ -42,12 +42,14 @@ Deno.serve(async (req) => {
 
     // Deducir destino por seguridad si no viene en el payload
     const final_target_deposit = target_deposit || (deposit_code === '150101' ? '150103' : '150101');
+    const nowIso = new Date().toISOString();
 
     const payloadToInsert = {
+      EventId: crypto.randomUUID(),
       AggregateId: task_id,
       AggregateType: 'MissionTask',
       EventType: 'TaskCountRegistered',
-      UserId: user_id,
+      UserId: user_id || '00000000-0000-0000-0000-000000000000',
       CorrelationId: crypto.randomUUID(),
       Payload: {
         mission_id, task_id, deposit_code, sku_code,
@@ -56,20 +58,24 @@ Deno.serve(async (req) => {
         sales_during_audit: safeSales, 
         calculated_discrepancy
       },
-      Metadata: { client: "PWA_AuditoriaPlus_Interceptor_Live" }
+      Metadata: { client: "PWA_AuditoriaPlus_Interceptor_Live" },
+      SequenceNum: Date.now(),
+      Timestamp: nowIso,
+      Version: 1
     };
 
-    const { data, error } = await supabaseClient.from('EventStore').insert(payloadToInsert).select();
+    const { error } = await supabaseClient.from('EventStore').insert(payloadToInsert);
     if (error) throw new Error("Error Evento Principal: " + error.message);
 
     if (calculated_discrepancy !== 0) {
       const { error: discError } = await supabaseClient
         .from('EventStore')
         .insert({
+          EventId: crypto.randomUUID(),
           AggregateId: task_id,
           AggregateType: 'CrossDiscrepancy',
           EventType: 'DiscrepancyDetected',
-          UserId: user_id,
+          UserId: user_id || '00000000-0000-0000-0000-000000000000',
           CorrelationId: crypto.randomUUID(),
           Payload: {
             discrepancy_id: crypto.randomUUID(),
@@ -79,13 +85,16 @@ Deno.serve(async (req) => {
             sku_code: sku_code,
             sku_description: "SKU " + sku_code,
             origin_discrepancy: calculated_discrepancy,
-            target_system_quantity: safeTargetSystem, // <-- AHORA INYECTA EL STOCK DEL DESTINO EN VIVO
+            target_system_quantity: safeTargetSystem,
             status: "PENDING_TARGET_COUNT"
           },
-          Metadata: { trigger: "auto_discrepancy" }
+          Metadata: { trigger: "auto_discrepancy" },
+          SequenceNum: Date.now() + 1,
+          Timestamp: nowIso,
+          Version: 1
         });
         
-        if (discError) throw new Error("Error Evento Discrepancia: " + discError.message);
+      if (discError) throw new Error("Error Evento Discrepancia: " + discError.message);
     }
 
     return new Response(

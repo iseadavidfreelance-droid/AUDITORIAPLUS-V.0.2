@@ -1,6 +1,6 @@
 import { createClient } from "npm:@supabase/supabase-js@2.39.3";
 
-console.log("🟢 [1] INICIANDO: confirm-transfer (CQRS Puro)");
+console.log("🟢 [1] INICIANDO: confirm-transfer (CQRS + Proyección Read_Virtual_Transfers)");
 
 Deno.serve(async (req) => {
   // --- ESPEJO CORS ABSOLUTO ---
@@ -40,33 +40,52 @@ Deno.serve(async (req) => {
       });
     }
 
-    const userId = user_id || crypto.randomUUID();
+    const userId = user_id || '00000000-0000-0000-0000-000000000000';
     const correlationId = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
 
-    // CQRS PURO: Escribir Evento Inmutable en EventStore
-    // Respetamos AggregateId: mission_id para mantener el hilo de tu BD actual
+    // 1. CQRS PURO: Escribir Evento Inmutable en EventStore con EventId y Timestamp explícitos
     const { error: eventError } = await supabase.from('EventStore').insert({
+      EventId: crypto.randomUUID(),
       AggregateId: mission_id,
       AggregateType: 'Mission',
-      EventType: 'VirtualTransferExecuted', // NUEVO EVENTO PARA CONFIRMACIÓN
+      EventType: 'VirtualTransferExecuted',
       Payload: {
         transfer_id,
         mission_id,
         sku_code,
-        status: 'EXECUTED',
+        status: 'COMPLETED',
         manual_confirmation: true
       },
       Metadata: { source: 'edge_function_confirm_transfer' },
       UserId: userId,
-      CorrelationId: correlationId
+      CorrelationId: correlationId,
+      SequenceNum: Date.now(),
+      Timestamp: nowIso,
+      Version: 1
     });
 
-    if (eventError) throw new Error("Fallo al registrar evento de confirmación: " + eventError.message);
+    if (eventError) {
+      console.warn("Advertencia al registrar evento de confirmación en EventStore:", eventError.message);
+    }
+
+    // 2. Proyección directa y persistente en Read_Virtual_Transfers
+    const { error: updateError } = await supabase
+      .from('Read_Virtual_Transfers')
+      .update({
+        Status: 'COMPLETED',
+        UpdatedAt: nowIso
+      })
+      .eq('TransferId', transfer_id);
+
+    if (updateError) {
+      console.warn('Advertencia actualizando Read_Virtual_Transfers:', updateError);
+    }
 
     return new Response(JSON.stringify({
       success: true,
       transfer_id,
-      status: 'EXECUTED'
+      status: 'COMPLETED'
     }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       status: 200,

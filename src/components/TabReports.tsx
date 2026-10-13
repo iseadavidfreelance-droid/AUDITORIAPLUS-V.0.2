@@ -82,13 +82,25 @@ export const TabReports: React.FC = () => {
     fetchTransfers();
   }, [fetchTransfers]);
 
-  // Cálculos consolidados
+  // Cálculos consolidados en tiempo real a partir de las tareas activas
   const totalSkus = metrics.totalSkus || tasks.length || 0;
   const countedSkus = metrics.countedSkus || 0;
   const pendingSkus = metrics.pendingSkus || Math.max(0, totalSkus - countedSkus);
   const discrepantSkus = metrics.discrepantSkus || 0;
   const reconciledSkus = metrics.reconciledSkus || 0;
-  const costImpact = Math.abs(metrics.totalCostDiscrepancy || 0);
+
+  // Impacto en Costo ($) reactivo e inmune a sobreescritura de sondeos
+  const costImpact = useMemo(() => {
+    if (tasks && tasks.length > 0) {
+      const sum = tasks.reduce((acc, t) => {
+        const disc = Number(t.Discrepancy ?? 0);
+        const cost = Number(t.Cost ?? 0);
+        return acc + (disc * cost);
+      }, 0);
+      return Math.abs(sum);
+    }
+    return Math.abs(metrics.totalCostDiscrepancy || 0);
+  }, [tasks, metrics.totalCostDiscrepancy]);
 
   const auditAccuracyPercent = totalSkus > 0
     ? Math.round((countedSkus / totalSkus) * 100)
@@ -367,11 +379,12 @@ export const TabReports: React.FC = () => {
     setTimeout(() => setToast(null), 4000);
   };
 
-  // AISLAMIENTO: Filtramos los traslados para solo mostrar los confirmados.
+  // AISLAMIENTO: Filtramos los traslados confirmados/ejecutados
   const executedTransfers = useMemo(() => {
-    return virtualTransfers.filter(
-      (vt) => vt.Status === 'COMPLETED' || (vt as any).status === 'COMPLETED'
-    );
+    return virtualTransfers.filter((vt) => {
+      const st = String(vt.Status || (vt as any).status || '').toUpperCase();
+      return st === 'COMPLETED' || st === 'EXECUTED';
+    });
   }, [virtualTransfers]);
 
   // Filtros reactivos para la lista de Traslados Virtuales Registrados

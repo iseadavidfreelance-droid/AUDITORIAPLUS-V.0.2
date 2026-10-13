@@ -1,6 +1,6 @@
 {
-  "summary": "Plan detallado para optimización de escaneo automático en colectores Android, cancelación y borrado de falsas discrepancias con persistencia CQRS, teclado de conteo rápido centrado en cantidad ERP (-2, -1, ERP, +1, +2), modal estilizado para confirmación de traslados, y nombres descriptivos de depósitos (ALMACÉN 150101 y PISO DE VENTAS 150103).",
-  "updatedAt": "2026-10-13T16:48:30.942365177Z",
+  "summary": "Plan integral para la resolución de los 4 errores de Supabase y Edge Functions:\n1. Corrección de error PGRST204 al eliminar discrepancias (eliminación de columna inexistente ResolvedAt y estandarización con Status y UpdatedAt).\n2. Resolución del error 23505 (violación de clave primaria en EventStore) unificando la generación de eventos en la Edge Function register-count con UUID únicos y eliminando duplicación de escrituras.\n3. Corrección de la confirmación de traslados virtuales en TabFloorReconciliation y la Edge Function confirm-transfer para persistir el estado COMPLETED en Read_Virtual_Transfers y reflejarlos inmediatamente en Reportes.\n4. Solución definitiva al cálculo y visualización intermitente de Impacto en Costo ($), vinculándolo reactivamente a las tareas activas y protegiendo useMissionStore del sobreescrito de sondeo.",
+  "updatedAt": "2026-10-13T17:30:49.897452882Z",
   "requestFeedback": true,
   "userFacing": true
 }

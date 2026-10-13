@@ -377,7 +377,6 @@ export const TabFloorReconciliation: React.FC = () => {
           .from('Read_Floor_Discrepancies')
           .update({
             Status: 'CANCELADA',
-            ResolvedAt: nowIso,
             UpdatedAt: nowIso
           })
           .eq('DiscrepancyId', discId);
@@ -454,52 +453,39 @@ export const TabFloorReconciliation: React.FC = () => {
         )
       );
 
-      // Generador de UUID nativo para cumplir con la arquitectura estricta del EventStore
-      const generateUUID = () => {
-        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-          const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
-          return v.toString(16);
-        });
-      };
-
-      // 2. INSERCIÓN DIRECTA EN EL EVENTSTORE (Cumpliendo esquema estricto CQRS)
-      const { error: eventError } = await supabase.from('EventStore').insert({
-        EventId: generateUUID(),
-        EventType: 'VirtualTransferExecuted',
-        AggregateId: transferIdToConfirm,
-        AggregateType: 'VirtualTransfer',
-        UserId: user?.id || '00000000-0000-0000-0000-000000000000',
-        CorrelationId: generateUUID(),
-        Version: 1,
-        Metadata: { appVersion: '1.0.0', source: 'TabFloorReconciliation' },
-        Payload: {
-          transfer_id: transferIdToConfirm,
-          mission_id: missionId,
-          sku_code: skuCode,
-          sku_description: transfer.SkuDescription || transfer.skuDescription || 'Artículo',
-          transfer_quantity: transferQty,
-          from_deposit: transfer.FromDeposit || transfer.OriginDeposit,
-          to_deposit: transfer.ToDeposit || transfer.DestinationDeposit
-        }
-      });
-
-      if (eventError) {
-        console.error('Error insertando en EventStore:', eventError);
+      // 2. Persistencia Incondicional en Read_Virtual_Transfers de Supabase
+      if (isOnline && isSupabaseConfigured) {
         const { error: dbError } = await supabase
           .from('Read_Virtual_Transfers')
           .update({ Status: 'COMPLETED', UpdatedAt: new Date().toISOString() })
           .eq('TransferId', transferIdToConfirm);
 
-        if (dbError) throw dbError;
+        if (dbError) {
+          console.warn('[TabFloorReconciliation] Advertencia al actualizar Read_Virtual_Transfers:', dbError);
+        }
+
+        // 3. Invocar Edge Function confirm-transfer para registrar evento y mantener CQRS
+        const { error: fnErr } = await supabase.functions.invoke('confirm-transfer', {
+          body: {
+            transfer_id: transferIdToConfirm,
+            mission_id: missionId,
+            sku_code: skuCode,
+            user_id: user?.id
+          }
+        });
+
+        if (fnErr) {
+          console.warn('[TabFloorReconciliation] Edge Function confirm-transfer retornó advertencia:', fnErr);
+        }
       }
 
       showToast('Traslado confirmado exitosamente en el ERP.', 'success');
 
-      // 3. Refrescar vistas para sincronizar la matemática en Reportes
+      // 4. Refrescar vistas para sincronizar la matemática en Reportes
       setTimeout(async () => {
         await fetchOpenDiscrepancies();
         if (activeMissionId) fetchMissionTasks(activeMissionId);
-      }, 1000);
+      }, 600);
       
     } catch (err) {
       console.error('Error aprobando traslado:', err);
